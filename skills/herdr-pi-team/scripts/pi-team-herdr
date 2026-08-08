@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Safe JSON-first herdr wrapper for visible pi team panes (stdlib only)."""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+NAME='pi-team-herdr';VERSION='0.1.0';PREFIX='π - ';MODEL='opencode/deepseek-v4-flash-free';EXT='~/.pi/agent/extensions/team.ts';SESSION=None
+def emit(x): print(json.dumps(x,ensure_ascii=False))
+def fail(n,c,m,s): print(json.dumps({'error':True,'code':c,'message':m,'suggestion':s}),file=sys.stderr);raise SystemExit(n)
+class P(argparse.ArgumentParser):
+ def error(self,m):fail(1,'USAGE',m,'run --help')
+def run(a):
+ cmd=['herdr']+(['--session',SESSION] if SESSION else [])+a
+ try:return subprocess.run(cmd,capture_output=True,text=True,timeout=20)
+ except FileNotFoundError:fail(2,'MUX_UNAVAILABLE','herdr binary not found','install herdr and start a session')
+ except subprocess.TimeoutExpired:fail(2,'MUX_TIMEOUT','herdr command timed out','check the herdr server')
+def data(a):
+ q=run(a)
+ if q.returncode:fail(2,'MUX_UNAVAILABLE',q.stderr.strip() or 'herdr API unavailable','start/attach herdr')
+ try:return json.loads(q.stdout)['result']
+ except Exception:fail(2,'INVALID_RESPONSE','herdr returned invalid JSON','upgrade herdr or check its server')
+def panes():
+ ps=data(['pane','list']).get('panes',[]);out=[]
+ for p in ps:
+  title=p.get('title') or p.get('label') or ''; out.append({'paneId':p.get('pane_id') or p.get('id'),'tabId':p.get('tab_id'),'workspaceId':p.get('workspace_id'),'title':title,'label':p.get('label') or (title[4:] if title.startswith(PREFIX) else p.get('agent')),'agentState':p.get('agent_status') or p.get('agent_state') or p.get('state'),'isPi':bool(p.get('agent') or title.startswith(PREFIX))})
+ return out
+def brief():return {'name':NAME,'version':VERSION,'backend':'herdr','purpose':'Manage named pi agents in one explicit Herdr session/workspace/tab/pane hierarchy.','commands':['list','launch','send','status','cleanup'],'sessionFlag':'--session NAME (use consistently with the visible herdr client)'}
+def read_brief(path):
+ try:
+  with open(path,'r',encoding='utf-8') as f:return f.read()
+ except OSError as e:fail(2,'BRIEF_NOT_READABLE','brief file is not readable',str(e) or 'create the brief first')
+def main(v):
+ p=P(prog=NAME);p.add_argument('--brief',action='store_true');p.add_argument('--version',action='store_true');p.add_argument('--session',help='Herdr session name; use the same value for the visible Herdr client and all worker commands');s=p.add_subparsers(dest='cmd')
+ x=s.add_parser('list');x.add_argument('--human',action='store_true')
+ x=s.add_parser('launch');x.add_argument('--name',required=True);x.add_argument('--brief-file',required=True);x.add_argument('--cwd',default=os.getcwd());x.add_argument('--workspace',help='target Herdr workspace ID; avoids relying on whichever workspace is focused');x.add_argument('--model',default=MODEL);x.add_argument('--thinking',choices=['off','minimal','low','medium','high','xhigh','max'],help='Pi reasoning effort for this worker');x.add_argument('--extension',default=EXT)
+ x=s.add_parser('send');x.add_argument('--pane-id',required=True);x.add_argument('--text',required=True);x.add_argument('--require-idle',action='store_true');x.add_argument('--submit',action='store_true',help='submit sent text with Herdr key name enter');x.add_argument('--force',action='store_true')
+ x=s.add_parser('status');x.add_argument('--human',action='store_true')
+ x=s.add_parser('cleanup');x.add_argument('--pattern',required=True);x.add_argument('--dry-run',action='store_true');x.add_argument('--confirm',action='store_true');x.add_argument('--force',action='store_true')
+ a=p.parse_args(v)
+ global SESSION
+ SESSION=a.session
+ if a.version:emit({'name':NAME,'version':VERSION});return
+ if a.brief or not a.cmd:emit(brief());return
+ ps=panes()
+ if a.cmd=='list': emit({'panes':ps,'count':len(ps)}) if not a.human else print('\n'.join('%s  %s' %(z['paneId'],z['title']) for z in ps));return
+ if a.cmd=='status': emit({'workers':[{'paneId':z['paneId'],'label':z['label'],'state':z['agentState']} for z in ps if z['isPi']]});return
+ if a.cmd=='launch':
+  if not os.path.isfile(a.brief_file):fail(2,'BRIEF_NOT_READABLE','brief file is not readable','create the brief first')
+  brief_text=read_brief(a.brief_file)
+  launch=['agent','start',a.name,'--cwd',os.path.abspath(a.cwd)]+(['--workspace',a.workspace] if a.workspace else [])+['--','pi','-e',os.path.expanduser(a.extension),'--model',a.model]+(['--thinking',a.thinking] if a.thinking else [])+['--name',a.name,brief_text]
+  q=run(launch)
+  if q.returncode:fail(2,'LAUNCH_FAILED',q.stderr.strip() or 'herdr agent start failed','check the herdr session')
+  emit({'launched':True,'title':PREFIX+a.name,'cwd':os.path.abspath(a.cwd),'workspaceId':a.workspace,'thinking':a.thinking,'briefChars':len(brief_text)});return
+ if a.cmd=='send':
+  z=next((z for z in ps if str(z['paneId'])==str(a.pane_id)),None)
+  if not z:fail(2,'NOT_FOUND','pane not found','run list')
+  if not z['isPi'] and not a.force:fail(3,'SAFETY_REFUSAL','refusing non-pi pane','use --force deliberately')
+  if a.require_idle and z['agentState']!='idle' and not a.force:fail(3,'SAFETY_REFUSAL','agent is not idle','wait or use --force deliberately')
+  q=run(['agent','send',str(a.pane_id),a.text])
+  if q.returncode:fail(2,'SEND_FAILED',q.stderr.strip() or 'herdr agent send failed','check the target')
+  if a.submit:
+   q=run(['pane','send-keys',str(a.pane_id),'enter'])
+   if q.returncode:fail(2,'SUBMIT_FAILED',q.stderr.strip() or 'herdr pane send-keys enter failed','the message was sent but was not submitted')
+  emit({'paneId':a.pane_id,'sent':True,'submitted':bool(a.submit),'chars':len(a.text),'fenced':True});return
+ try:rx=re.compile(a.pattern)
+ except re.error as e:fail(1,'INVALID_PATTERN','cleanup pattern is not a valid regex',str(e))
+ matches=[z for z in ps if rx.search(z['title'])]
+ if a.dry_run or not a.confirm:emit({'dryRun':True,'pattern':a.pattern,'matches':matches,'killed':[]});return
+ killed=[]
+ for z in matches:
+  if not z['isPi'] and not a.force:continue
+  q=run(['pane','close',str(z['paneId'])])
+  if q.returncode:fail(2,'CLEANUP_FAILED',q.stderr.strip() or 'herdr pane close failed','retry after checking herdr')
+  killed.append({'paneId':z['paneId'],'title':z['title']})
+ emit({'dryRun':False,'pattern':a.pattern,'matches':matches,'killed':killed})
+if __name__=='__main__':main(sys.argv[1:])

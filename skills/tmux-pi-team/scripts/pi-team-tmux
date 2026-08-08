@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Safe JSON-first tmux wrapper for visible pi team panes (stdlib only)."""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+NAME='pi-team-tmux';VERSION='0.1.0';PREFIX='π - ';MODEL='opencode/deepseek-v4-flash-free';EXT='~/.pi/agent/extensions/team.ts'
+def emit(x):print(json.dumps(x,ensure_ascii=False))
+def fail(n,c,m,s):print(json.dumps({'error':True,'code':c,'message':m,'suggestion':s}),file=sys.stderr);raise SystemExit(n)
+class P(argparse.ArgumentParser):
+ def error(self,m):fail(1,'USAGE',m,'run --help')
+def run(a):
+ try:return subprocess.run(['tmux']+a,capture_output=True,text=True,timeout=20)
+ except FileNotFoundError:fail(2,'MUX_UNAVAILABLE','tmux binary not found','install tmux')
+ except subprocess.TimeoutExpired:fail(2,'MUX_TIMEOUT','tmux command timed out','check tmux server')
+def panes():
+ q=run(['list-panes','-a','-F','#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}\t#{pane_current_command}'])
+ if q.returncode:fail(2,'MUX_UNAVAILABLE','tmux server is not running','start tmux with tmux new-session')
+ o=[]
+ for line in q.stdout.splitlines():
+  z=line.split('\t');title=z[4];o.append({'paneId':z[0],'session':z[1],'windowId':z[2],'windowIndex':z[3],'title':title,'command':z[5],'label':title[4:] if title.startswith(PREFIX) else None,'isPi':title.startswith(PREFIX)})
+ return o
+def brief():return {'name':NAME,'version':VERSION,'backend':'tmux','purpose':'Manage named pi agents in tmux session/window/pane hierarchy safely.','commands':['list','launch','send','status','cleanup']}
+def read_brief(path):
+ try:
+  with open(path,'r',encoding='utf-8') as f:return f.read()
+ except OSError as e:fail(2,'BRIEF_NOT_READABLE','brief file is not readable',str(e) or 'create the brief first')
+def main(v):
+ p=P(prog=NAME);p.add_argument('--brief',action='store_true');p.add_argument('--version',action='store_true');s=p.add_subparsers(dest='cmd')
+ x=s.add_parser('list');x.add_argument('--human',action='store_true')
+ x=s.add_parser('launch');x.add_argument('--name',required=True);x.add_argument('--brief-file',required=True);x.add_argument('--cwd',default=os.getcwd());x.add_argument('--model',default=MODEL);x.add_argument('--extension',default=EXT);x.add_argument('--split',choices=['right','bottom','spawn'],default='bottom')
+ x=s.add_parser('send');x.add_argument('--pane-id',required=True);x.add_argument('--text',required=True);x.add_argument('--require-idle',action='store_true');x.add_argument('--force',action='store_true')
+ x=s.add_parser('status');x.add_argument('--human',action='store_true')
+ x=s.add_parser('cleanup');x.add_argument('--pattern',required=True);x.add_argument('--dry-run',action='store_true');x.add_argument('--confirm',action='store_true');x.add_argument('--force',action='store_true')
+ a=p.parse_args(v)
+ if a.version:emit({'name':NAME,'version':VERSION});return
+ if a.brief or not a.cmd:emit(brief());return
+ ps=panes()
+ if a.cmd=='list':emit({'panes':ps,'count':len(ps)}) if not a.human else print('\n'.join('%s  %s' %(z['paneId'],z['title']) for z in ps));return
+ if a.cmd=='status':emit({'workers':[{'paneId':z['paneId'],'label':z['label']} for z in ps if z['isPi']]});return
+ if a.cmd=='launch':
+  if not os.path.isfile(a.brief_file):fail(2,'BRIEF_NOT_READABLE','brief file is not readable','create the brief first')
+  brief_text=read_brief(a.brief_file)
+  cmd=shlex.join(['exec','pi','-e',os.path.expanduser(a.extension),'--model',a.model,'--name',a.name,brief_text])
+  if a.split=='spawn':q=run(['new-window','-P','-F','#{pane_id}','-n',PREFIX+a.name,'-c',os.path.abspath(a.cwd),cmd])
+  else:q=run(['split-window','-P','-F','#{pane_id}','-h' if a.split=='right' else '-v','-c',os.path.abspath(a.cwd),cmd])
+  if q.returncode:fail(2,'LAUNCH_FAILED',q.stderr.strip() or 'tmux launch failed','check tmux state')
+  pid=q.stdout.strip();run(['select-pane','-t',pid,'-T',PREFIX+a.name]);emit({'paneId':pid,'launched':True,'split':a.split,'title':PREFIX+a.name,'briefChars':len(brief_text)});return
+ if a.cmd=='send':
+  z=next((z for z in ps if z['paneId']==a.pane_id),None)
+  if not z:fail(2,'NOT_FOUND','pane not found','run list')
+  if not z['isPi'] and not a.force:fail(3,'SAFETY_REFUSAL','refusing non-pi pane','use --force deliberately')
+  q=run(['send-keys','-t',a.pane_id,'-l',a.text]);q2=run(['send-keys','-t',a.pane_id,'Enter'])
+  if q.returncode or q2.returncode:fail(2,'SEND_FAILED',(q.stderr+q2.stderr).strip(),'check tmux target')
+  emit({'paneId':a.pane_id,'sent':True,'chars':len(a.text),'fenced':True});return
+ try:rx=re.compile(a.pattern)
+ except re.error as e:fail(1,'INVALID_PATTERN','cleanup pattern is not a valid regex',str(e))
+ matches=[z for z in ps if rx.search(z['title'])]
+ if a.dry_run or not a.confirm:emit({'dryRun':True,'pattern':a.pattern,'matches':matches,'killed':[]});return
+ killed=[]
+ for z in matches:
+  if not z['isPi'] and not a.force:continue
+  q=run(['kill-pane','-t',z['paneId']])
+  if q.returncode:fail(2,'CLEANUP_FAILED',q.stderr.strip() or 'tmux kill-pane failed','retry after checking tmux')
+  killed.append({'paneId':z['paneId'],'title':z['title']})
+ emit({'dryRun':False,'pattern':a.pattern,'matches':matches,'killed':killed})
+if __name__=='__main__':main(sys.argv[1:])

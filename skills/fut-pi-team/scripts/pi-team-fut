@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Safe JSON-first fut wrapper for visible pi team panes (stdlib only)."""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+NAME='pi-team-fut'; BACKEND='fut'; VERSION='0.1.0'; PREFIX='π - '; MODEL='opencode/deepseek-v4-flash-free'; EXT='~/.pi/agent/extensions/team.ts'
+def emit(x): print(json.dumps(x,ensure_ascii=False))
+def fail(n,c,m,s): print(json.dumps({'error':True,'code':c,'message':m,'suggestion':s}),file=sys.stderr); raise SystemExit(n)
+class P(argparse.ArgumentParser):
+ def error(self,m): fail(1,'USAGE',m,'run --help')
+def run(a):
+ try: return subprocess.run(['fut']+a,capture_output=True,text=True,timeout=20)
+ except FileNotFoundError: fail(2,'MUX_UNAVAILABLE','fut binary not found','install fut and start its daemon')
+ except subprocess.TimeoutExpired: fail(2,'MUX_TIMEOUT','fut command timed out','check the fut daemon')
+def rawlist():
+ p=run(['list','--json'])
+ if p.returncode: fail(2,'MUX_UNAVAILABLE','cannot reach fut daemon',p.stderr.strip() or 'start fut')
+ try:return json.loads(p.stdout)['result']
+ except Exception: fail(2,'INVALID_RESPONSE','fut returned invalid JSON','upgrade fut or check its daemon')
+def panes():
+ out=[]
+ for s in rawlist().get('sessions',[]):
+  for w in s.get('workspaces',[]):
+   for t in w.get('tabs',[]):
+    for p in t.get('panes',[]): out.append({'paneId':p['id'],'tabId':t['id'],'workspaceId':w['id'],'sessionId':s['id'],'title':t.get('name',''),'cwd':w.get('root'),'label':t.get('name','')[4:] if t.get('name','').startswith(PREFIX) else None,'isPi':t.get('name','').startswith(PREFIX)})
+ return out
+def brief(): return {'name':NAME,'version':VERSION,'purpose':'Manage named pi agents in fut session/workspace/tab/pane hierarchy safely.','commands':['list','launch','send','status','cleanup'],'backend':'fut'}
+def read_brief(path):
+ try:
+  with open(path,'r',encoding='utf-8') as f:return f.read()
+ except OSError as e:fail(2,'BRIEF_NOT_READABLE','brief file is not readable',str(e) or 'create the brief first')
+def listcmd(a):
+ ps=panes(); emit({'panes':ps,'count':len(ps)}) if not a.human else print('\n'.join('%s  %s' %(x['paneId'],x['title']) for x in ps))
+def launch(a):
+ if not os.path.isfile(a.brief_file): fail(2,'BRIEF_NOT_READABLE','brief file is not readable','create the brief first')
+ brief_text=read_brief(a.brief_file)
+ ws=rawlist().get('sessions',[{}])[0].get('workspaces',[{}])[0]
+ if not ws.get('id'): fail(2,'NO_WORKSPACE','no fut workspace available','open a workspace in fut first')
+ cmd=['tab','new','--json','--name',PREFIX+a.name,'--cwd',os.path.abspath(a.cwd),'%s'%ws['id'],'--','pi','-e',os.path.expanduser(a.extension),'--model',a.model,'--name',a.name,brief_text]
+ p=run(cmd)
+ if p.returncode: fail(2,'LAUNCH_FAILED',p.stderr.strip() or 'fut tab new failed','check fut daemon and workspace')
+ emit({'launched':True,'split':'tab','cwd':os.path.abspath(a.cwd),'title':PREFIX+a.name,'piCommand':'pi --name '+a.name,'briefChars':len(brief_text)})
+def unsupported(op): fail(2,'UNSUPPORTED_BY_FUT','fut does not currently expose scripted terminal input/read APIs for '+op,'use fut terminal attach manually; list/launch/cleanup are supported')
+def cleanup(a):
+ try:rx=re.compile(a.pattern)
+ except re.error as e:fail(1,'INVALID_PATTERN','cleanup pattern is not a valid regex',str(e))
+ matches=[p for p in panes() if rx.search(p['title'])]
+ if a.dry_run or not a.confirm: emit({'dryRun':True,'pattern':a.pattern,'matches':matches,'killed':[]}); return
+ # fut closes panes; never allow a broad closing operation.
+ killed=[]
+ for p in matches:
+  if not p['isPi'] and not a.force: continue
+  q=run(['pane','close','--json',p['paneId']])
+  if q.returncode: fail(2,'CLEANUP_FAILED',q.stderr.strip() or 'fut pane close failed','retry after checking fut')
+  killed.append({'paneId':p['paneId'],'title':p['title']})
+ emit({'dryRun':False,'pattern':a.pattern,'matches':matches,'killed':killed})
+def main(v):
+ p=P(prog=NAME); p.add_argument('--brief',action='store_true'); p.add_argument('--version',action='store_true'); sub=p.add_subparsers(dest='cmd')
+ x=sub.add_parser('list');x.add_argument('--human',action='store_true')
+ x=sub.add_parser('launch');x.add_argument('--name',required=True);x.add_argument('--brief-file',required=True);x.add_argument('--cwd',default=os.getcwd());x.add_argument('--model',default=MODEL);x.add_argument('--extension',default=EXT)
+ x=sub.add_parser('send');x.add_argument('--pane-id',required=True);x.add_argument('--text',required=True);x.add_argument('--force',action='store_true')
+ x=sub.add_parser('status');x.add_argument('--human',action='store_true')
+ x=sub.add_parser('cleanup');x.add_argument('--pattern',required=True);x.add_argument('--dry-run',action='store_true');x.add_argument('--confirm',action='store_true');x.add_argument('--force',action='store_true')
+ a=p.parse_args(v)
+ if a.version: emit({'name':NAME,'version':VERSION})
+ elif a.brief or not a.cmd: emit(brief())
+ elif a.cmd=='list': listcmd(a)
+ elif a.cmd=='launch': launch(a)
+ elif a.cmd=='cleanup': cleanup(a)
+ else: unsupported(a.cmd)
+if __name__=='__main__': main(sys.argv[1:])

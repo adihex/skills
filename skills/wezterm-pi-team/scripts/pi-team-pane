@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""pi-team-pane — split WezTerm panes, launch named pi agents, steer & monitor them, clean up safely.
+
+AI-native CLI: JSON to stdout by default, --human for tables, structured errors to stderr,
+exit codes 0=ok / 1=usage / 2=runtime-wezterm / 3=safety-refusal. Stdlib only.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+from collections import Counter
+
+VERSION = "0.2.0"
+MODEL_DEFAULT = "opencode/deepseek-v4-flash-free"
+EXTENSION_DEFAULT = "~/.pi/agent/extensions/team.ts"
+STATUS_ROOT_DEFAULT = "/tmp/team-task/status"
+TITLE_PREFIX = "\u03c0 - "  # "π - " (pi space dash space) — set by `pi --name <label>`
+WZ_TIMEOUT_ENV = "PI_TEAM_PANE_WZ_TIMEOUT"
+
+
+# ---------------------------------------------------------------------------
+# output / errors
+# ---------------------------------------------------------------------------
+
+def fail(code, message, suggestion=None):
+    """Emit a structured error JSON to stderr and exit with `code`."""
+    err = {"error": True, "code": code, "message": message}
+    if suggestion:
+        err["suggestion"] = suggestion
+    json.dump(err, sys.stderr, indent=2)
+    sys.stderr.write("\n")
+    sys.exit(code)
+
+
+def wz_timeout_sec():
+    """Parse WezTerm CLI timeout from env; report bad values as structured errors."""
+    raw = os.environ.get(WZ_TIMEOUT_ENV, "30")
+    try:
+        value = float(raw)
+    except ValueError:
+        fail(1, "invalid %s: %r" % (WZ_TIMEOUT_ENV, raw),
+             "set %s to a positive number of seconds" % WZ_TIMEOUT_ENV)
+    if value <= 0:
+        fail(1, "invalid %s: %r" % (WZ_TIMEOUT_ENV, raw),
+             "set %s to a positive number of seconds" % WZ_TIMEOUT_ENV)
+    return value
+
+
+def emit(obj):
+    json.dump(obj, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+class CliParser(argparse.ArgumentParser):
+    """argparse wrapper that reports usage errors as error-JSON with exit code 1."""
+
+    def error(self, message):
+        fail(1, message, "see 'pi-team-pane --help' for usage")
+
+
+# ---------------------------------------------------------------------------
+# wezterm plumbing
+# ---------------------------------------------------------------------------
+
+def wz(argv, cwd=None):
+    """Run `wezterm cli <argv>`; returns (rc, stdout, stderr). Adds --class if WEZTERM_CLASS is set."""
+    cmd = ["wezterm", "cli"]
+    cls = os.environ.get("WEZTERM_CLASS")
+    if cls:
+        cmd += ["--class", cls]
+    cmd += argv
+    timeout_sec = wz_timeout_sec()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout_sec)
+    except FileNotFoundError:
+        fail(2, "wezterm binary not found on PATH", "install wezterm or add its bin directory to PATH")
+    except subprocess.TimeoutExpired:
+        fail(2, "wezterm cli timed out after %.1fs" % timeout_sec,
+             "check whether the wezterm mux is hung; override with PI_TEAM_PANE_WZ_TIMEOUT if needed")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def submit_key():
+    """Key sequence that submits a line in the target PTY."""
+    return "\n" if sys.platform == "win32" else "\r"
+
+
+def percent_int(s):
+    """argparse type for --percent: integer in 10..90 (split-pane sizing)."""
+    v = int(s)
+    if not (10 <= v <= 90):
+        raise argparse.ArgumentTypeError("--percent must be 10..90 (got %d)" % v)
+    return v
+
+
+def current_pane_id():
+    v = os.environ.get("WEZTERM_PANE")
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
+
+
+def decode_cwd(cwd_uri):
+    if not cwd_uri:
+        return None
+    if cwd_uri.startswith("file://"):
+        return urllib.parse.unquote(cwd_uri[len("file://"):])
+    return cwd_uri
+
+
+def parse_title(title):
+    """Title convention: 'π - <label> - <project>'. A bare 'π - <project>' has label=None."""
+    if not title or not title.startswith(TITLE_PREFIX):
+        return None, None
+    rest = title[len(TITLE_PREFIX):]
+    parts = [x.strip() for x in rest.split(" - ")]
+    if len(parts) >= 2:
+        return parts[0], " - ".join(parts[1:])
+    return None, rest.strip()
+
+
+def list_panes():
+    """Preflight + parse `wezterm cli list --format json`. Exits 2 if wezterm is unreachable."""
+    rc, out, err = wz(["list", "--format", "json"])
+    if rc != 0:
+        fail(2, "cannot reach wezterm mux",
+             "start the wezterm GUI, or set WEZTERM_CLASS if you launched it with --class SOMETHING")
+    try:
+        raw = json.loads(out)
+    except (ValueError, json.JSONDecodeError):
+        fail(2, "wezterm list returned invalid JSON", "check your wezterm version")
+    cur = current_pane_id()
+    panes = []
+    for p in raw:
+        title = p.get("title") or ""
+        label, project = parse_title(title)
+        panes.append({
+            "paneId": p.get("pane_id"),
+            "tabId": p.get("tab_id"),
+            "winId": p.get("window_id"),
+            "title": title,
+            "cwd": decode_cwd(p.get("cwd")),
+            "label": label,
+            "project": project,
+            "isActive": bool(p.get("is_active")),
+            "isCurrent": cur is not None and p.get("pane_id") == cur,
+            "isPane0": p.get("pane_id") == 0,
+        })
+    return panes, cur
+
+
+def find_pane(panes, pid):
+    for p in panes:
+        if p["paneId"] == pid:
+            return p
+    return None
+
+
+def home_display(path):
+    home = os.path.expanduser("~")
+    if path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+
+def is_pi_pane(pane):
+    """True when a pane looks like one launched by this skill/pi --name convention."""
+    return bool(pane and (pane.get("title") or "").startswith(TITLE_PREFIX))
+
+
+def get_pane_text(pid, lines=30):
+    """Read recent pane text. Returns (rc, text, err); callers decide whether failure is fatal."""
+    return wz(["get-text", "--pane-id", str(pid), "--start-line", "-%d" % int(lines)])
+
+
+def detect_cli_state(text):
+    """Cheap, conservative pane-state guess from recent visible text/scrollback."""
+    lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return "unknown"
+    tail = "\n".join(lines[-8:]).lower()
+    last = lines[-1].strip()
+    if re.search(r"(esc to interrupt|ctrl-c|thinking|running|working|processing|streaming|dispatching|turn \d+)", tail):
+        return "working"
+    if last in (">", "❯") or last.endswith(" ❯") or last.endswith(" >"):
+        return "idle"
+    return "unknown"
+
+
+def fenced_send_submit(pid, text):
+    """Send payload, perform a get-text round-trip fence, then submit with Enter.
+
+    WezTerm mux writes are async; separating payload and Enter with a read fence avoids
+    the occasional ordering race where Enter can arrive before the typed/pasted payload.
+    """
+    # Payload is sent as a paste (not --no-paste) so multiline text lands as input text;
+    # the submit key is sent raw afterward.
+    rc, out, err = wz(["send-text", "--pane-id", str(pid), text])
+    if rc != 0:
+        return rc, "payload", err
+    rc, out, err = get_pane_text(pid, lines=1)
+    if rc != 0:
+        return rc, "fence", err
+    rc, out, err = wz(["send-text", "--pane-id", str(pid), "--no-paste", submit_key()])
+    if rc != 0:
+        return rc, "submit", err
+    return 0, "sent", ""
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args):
+    panes, cur = list_panes()
+    if args.human:
+        rows = [("PANE", "WIN", "TAB", "CUR", "TITLE", "CWD")]
+        for p in panes:
+            rows.append((str(p["paneId"]), str(p["winId"]), str(p["tabId"]),
+                         "*" if p["isCurrent"] else "", p["title"] or "", p["cwd"] or ""))
+        widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+        sys.stdout.write("\n".join(
+            "  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip() for r in rows) + "\n")
+    else:
+        emit({"panes": panes, "currentPaneId": cur, "count": len(panes)})
+
+
+def do_launch(args):
+    """Shared by `launch` and `launch-and-dispatch`. Validates everything BEFORE spawning."""
+    brief_file = os.path.abspath(args.brief_file)
+    if not os.path.isfile(brief_file) or not os.access(brief_file, os.R_OK):
+        fail(2, "brief file not readable: %s" % brief_file, "create the brief file first, then retry")
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        fail(2, "cwd does not exist: %s" % cwd, "pass --cwd pointing at an existing directory")
+    host = current_pane_id()
+    if host is None:
+        fail(2, "WEZTERM_PANE is not set", "run this from inside a WezTerm pane (or set WEZTERM_PANE)")
+    list_panes()  # preflight: reachable mux before we spawn anything
+
+    ext = os.path.expanduser(args.extension or EXTENSION_DEFAULT)
+    model = args.model or MODEL_DEFAULT
+    pi_prog = ["pi", "-e", ext, "--model", model, "--name", args.name, "@" + brief_file]
+    if args.split == "spawn":
+        if args.percent is not None:
+            fail(1, "--percent only applies to split panes",
+                 "use --split right|bottom|left|top for a percent-sized split, or drop --percent")
+        rc, out, err = wz(["spawn", "--new-window", "--cwd", cwd, "--"] + pi_prog)
+        split = "spawn"
+    else:
+        direction = {"right": "--right", "bottom": "--bottom",
+                     "left": "--left", "top": "--top"}[args.split]
+        split_args = ["split-pane", "--pane-id", str(host), direction, "--cwd", cwd]
+        if args.percent is not None:
+            split_args += ["--percent", str(args.percent)]
+        rc, out, err = wz(split_args + ["--"] + pi_prog)
+        split = args.split
+    if rc != 0:
+        fail(2, "wezterm %s failed: %s" % (split, err), "check wezterm state; nothing was spawned")
+    try:
+        new_pid = int(out.strip())
+    except ValueError:
+        fail(2, "wezterm %s did not return a pane id (got %r)" % (split, out), "check wezterm version")
+    title = "%s%s - %s" % (TITLE_PREFIX, args.name, os.path.basename(cwd))
+    pi_cmd = " ".join(["pi", "-e", home_display(ext), "--model", model, "--name", args.name, "@" + home_display(brief_file)])
+    return new_pid, split, title, pi_cmd
+
+
+def cmd_launch(args):
+    pid, split, title, pi_cmd = do_launch(args)
+    emit({"paneId": pid, "split": split, "cwd": os.path.abspath(args.cwd or os.getcwd()),
+          "title": title, "piCommand": pi_cmd})
+
+
+def cmd_send(args):
+    panes, cur = list_panes()
+    pid = args.pane_id
+    pane = find_pane(panes, pid)
+    if pane is None:
+        fail(2, "pane %s not found" % pid, "check 'pi-team-pane list' for live pane ids")
+    if pid == 0 or (cur is not None and pid == cur):
+        if not args.force:
+            fail(3, "refusing to send text to protected pane %s (pane 0 / current pane)" % pid,
+                 "pass --force to override, or target another pane")
+    if not is_pi_pane(pane) and not args.force:
+        fail(3, "refusing to send text to non-pi pane %s" % pid,
+             "target a pane titled 'π - <label> - <project>', or pass --force for a deliberate manual override")
+
+    cli_state = "unknown"
+    rc, tail, err = get_pane_text(pid, lines=30)
+    if rc == 0:
+        cli_state = detect_cli_state(tail)
+    if args.require_idle and cli_state != "idle" and not args.force:
+        fail(3, "refusing to send to pane %s because cliState=%s" % (pid, cli_state),
+             "wait for an idle prompt, omit --require-idle, or pass --force for a deliberate override")
+
+    text = args.text
+    rc, phase, err = fenced_send_submit(pid, text)
+    if rc != 0:
+        fail(2, "send-text to pane %s failed during %s: %s" % (pid, phase, err), "check wezterm state")
+    emit({"paneId": pid, "sent": True, "chars": len(text), "cliState": cli_state, "fenced": True})  # never echo text
+
+
+def cmd_focus(args):
+    panes, cur = list_panes()
+    pid = args.pane_id
+    pane = find_pane(panes, pid)
+    if pane is None:
+        fail(2, "pane %s not found" % pid, "check 'pi-team-pane list' for live pane ids")
+    if pid == 0 or (cur is not None and pid == cur):
+        if not args.force:
+            fail(3, "refusing to focus protected pane %s (pane 0 / current pane)" % pid,
+                 "pass --force to override, or target another pane")
+    rc, out, err = wz(["activate-pane", "--pane-id", str(pid)])
+    if rc != 0:
+        fail(2, "activate-pane failed for pane %s: %s" % (pid, err), "check wezterm state")
+    emit({"paneId": pid, "focused": True})
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_status_tail(panes, args):
+    """status --tail <pane-id> [--lines N]: read recent pane text via get-text --start-line -N."""
+    pid = args.tail
+    lines = max(1, min(args.lines, 200))  # unconditional cap: --lines never exceeds 200
+    if find_pane(panes, pid) is None:
+        fail(2, "pane %s not found" % pid, "check 'pi-team-pane list' for live pane ids")
+    rc, text, err = get_pane_text(pid, lines)
+    if rc != 0:
+        fail(2, "get-text failed for pane %s: %s" % (pid, err), "check wezterm state")
+    cli_state = detect_cli_state(text)
+    if args.human:
+        sys.stderr.write("[cliState %s] pane %s, last %d lines\n" % (cli_state, pid, lines))
+        sys.stdout.write(text)
+        if text and not text.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+    emit({"paneId": pid, "lines": lines, "text": text, "cliState": cli_state})
+
+
+def cmd_status(args):
+    panes, cur = list_panes()  # preflight + live join data
+    if args.tail is not None:
+        cmd_status_tail(panes, args)
+        return
+    root = args.status_root or STATUS_ROOT_DEFAULT
+    dispatch_dir = args.dispatch
+    if dispatch_dir:
+        if not os.path.isdir(dispatch_dir):
+            fail(2, "dispatch dir not found: %s" % dispatch_dir,
+                 "check the path, or omit --dispatch to use the newest dispatch-* dir")
+    else:
+        candidates = sorted(glob.glob(os.path.join(root, "dispatch-*")),
+                            key=lambda d: os.path.getmtime(d), reverse=True)
+        if not candidates:
+            emit({"root": root, "dir": None, "dispatch": None, "workers": []})
+            return
+        dispatch_dir = candidates[0]
+
+    dispatch = read_json(os.path.join(dispatch_dir, "_dispatch.json")) or {}
+    by_label = {}
+    # Glob every *.json; skip dispatch meta; keep only per-worker records (have a label).
+    # Both worker-N.json / label.json and agent-* duplicates may exist -> dedupe by label,
+    # latest updatedAt wins; `source` = winning filename.
+    for f in sorted(glob.glob(os.path.join(dispatch_dir, "*.json"))):
+        base = os.path.basename(f)
+        if base in ("_dispatch.json", "agent-_dispatch.json"):
+            continue
+        rec = read_json(f)
+        if not rec or not isinstance(rec.get("label"), str):
+            continue
+        label = rec["label"]
+        prev = by_label.get(label)
+        if prev is None or (rec.get("updatedAt") or "") >= (prev.get("updatedAt") or ""):
+            rec["source"] = base
+            by_label[label] = rec
+
+    pane_by_label = {}
+    for p in panes:
+        if p["label"] and p["label"] not in pane_by_label:
+            pane_by_label[p["label"]] = p
+    workers, matched = [], []
+    for label in sorted(by_label):
+        rec = by_label[label]
+        w = {"label": label, "status": rec.get("status"), "activity": rec.get("activity"),
+             "turn": rec.get("turn"), "updatedAt": rec.get("updatedAt"),
+             "source": rec.get("source"), "paneId": None}
+        p = pane_by_label.get(label)
+        if p is not None:
+            w["paneId"] = p["paneId"]
+            matched.append({"paneId": p["paneId"], "title": p["title"], "label": label})
+        workers.append(w)
+
+    payload = {"root": root, "dir": dispatch_dir, "dispatch": dispatch,
+               "workers": workers, "panes": matched}
+    if args.human:
+        lines = ["root:    %s" % payload["root"]]
+        if payload["dir"]:
+            d = dispatch or {}
+            meta = "status=%s" % d.get("status")
+            if d.get("mode"):
+                meta += " mode=%s" % d["mode"]
+            if d.get("workerCount") is not None:
+                meta += " workers=%s" % d["workerCount"]
+            if d.get("workerModel"):
+                meta += " model=%s" % d["workerModel"]
+            lines.append("dispatch: %s  (%s)" % (payload["dir"], meta))
+            for w in workers:
+                pane = "pane %s" % w["paneId"] if w["paneId"] is not None else "no pane"
+                lines.append("  %-28s %-10s turn=%s  %s  src=%s"
+                             % (w["label"], str(w.get("status") or "?"), w.get("turn"), pane, w.get("source")))
+        else:
+            lines.append("dispatch: (none found)")
+        sys.stdout.write("\n".join(lines) + "\n")
+    else:
+        emit(payload)
+
+
+def cmd_cleanup(args):
+    pattern = args.pattern
+    if not pattern:
+        fail(1, "cleanup requires --pattern", "e.g. --pattern 'proto-|team-'")
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        fail(1, "invalid regex: %s" % e, "cleanup matches pane titles by regex")
+
+    panes, cur = list_panes()
+    win_counts = Counter(p["winId"] for p in panes)
+    kill_slots = {win_id: max(0, count - 1) for win_id, count in win_counts.items()}
+    reserved_kills = Counter()
+    real = bool(args.confirm) and not bool(args.dry_run)  # dry-run is the default
+
+    matches, skipped = [], []
+    for p in panes:
+        title = p["title"] or ""
+        label = p["label"] or ""
+        win_id = p["winId"]
+        if not rx.search(title) and not (label and rx.search(label)):
+            continue
+        reason = None
+        if p["paneId"] == 0:
+            reason = "protected-pane-0"
+        elif cur is not None and p["paneId"] == cur:
+            reason = "protected-current"
+        elif win_counts.get(win_id, 0) == 1:
+            reason = "last-pane-in-window"
+        elif not is_pi_pane(p) and not args.force:
+            reason = "not-pi-pane"
+        elif reserved_kills[win_id] >= kill_slots.get(win_id, 0):
+            reason = "would-kill-final-pane-in-window"
+        if reason:
+            skipped.append({"paneId": p["paneId"], "title": title, "reason": reason})
+            continue
+        matches.append({"paneId": p["paneId"], "title": title, "label": label})
+        reserved_kills[win_id] += 1
+
+    killed = []
+    if real:
+        for m in matches:
+            # Re-check immediately before every destructive operation. This closes the
+            # race where another process removes sibling panes after our dry-run math.
+            live_panes, live_cur = list_panes()
+            live_pane = find_pane(live_panes, m["paneId"])
+            live_counts = Counter(p["winId"] for p in live_panes)
+            reason = None
+            if live_pane is None:
+                reason = "pane-not-found"
+            elif live_pane["paneId"] == 0:
+                reason = "protected-pane-0"
+            elif live_cur is not None and live_pane["paneId"] == live_cur:
+                reason = "protected-current"
+            elif live_counts.get(live_pane["winId"], 0) <= 1:
+                reason = "last-pane-in-window"
+            elif not is_pi_pane(live_pane) and not args.force:
+                reason = "not-pi-pane"
+            if reason:
+                skipped.append({"paneId": m["paneId"], "title": m["title"], "reason": reason})
+                continue
+            rc, out, err = wz(["kill-pane", "--pane-id", str(m["paneId"])])
+            if rc != 0:
+                fail(2, "kill-pane failed for pane %s: %s" % (m["paneId"], err), "check wezterm state")
+            killed.append({"paneId": m["paneId"], "title": m["title"]})
+
+    payload = {"dryRun": not real, "pattern": pattern, "matches": matches,
+               "skipped": skipped, "killed": killed}
+    if args.human:
+        lines = ["pattern: %s  mode: %s" % (pattern, "DRY-RUN" if not real else "REAL")]
+        for s in skipped:
+            lines.append("  [SKIP:%s] pane %s: %s" % (s["reason"], s["paneId"], s["title"]))
+        for m in matches:
+            tag = "[DRY]" if not real else "[KILL]"
+            lines.append("  %s pane %s: %s" % (tag, m["paneId"], m["title"]))
+        for k in killed:
+            lines.append("  [KILLED] pane %s: %s" % (k["paneId"], k["title"]))
+        sys.stdout.write("\n".join(lines) + "\n")
+    else:
+        emit(payload)
+
+    if real and not killed and skipped:
+        fail(3, "cleanup refused: every matched pane is protected",
+             "pane 0 / current pane / last pane in window can never be killed by cleanup")
+
+
+def cmd_launch_dispatch(args):
+    pid, split, title, pi_cmd = do_launch(args)
+    text = args.dispatch_instruction
+    rc, phase, err = fenced_send_submit(pid, text)
+    if rc != 0:
+        fail(2, "launch succeeded but dispatch send failed during %s: %s" % (phase, err),
+             "worker pane %s is live; resend with: pi-team-pane send --pane-id %s --text '<instruction>'"
+             % (pid, pid))
+    emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True})
+
+
+# ---------------------------------------------------------------------------
+# parser / main
+# ---------------------------------------------------------------------------
+
+def brief_payload():
+    return {
+        "name": "pi-team-pane",
+        "version": VERSION,
+        "purpose": "Split WezTerm panes, launch named pi agents (team.ts), steer and monitor "
+                   "them via @worker messages and status dirs, and clean up stale team panes safely.",
+        "defaults": {"model": MODEL_DEFAULT, "extension": EXTENSION_DEFAULT,
+                     "cwd": "$PWD", "statusRoot": STATUS_ROOT_DEFAULT, "split": "bottom"},
+        "commands": [
+            {"command": "--brief", "summary": "show this identity"},
+            {"command": "list", "summary": "list live wezterm panes (JSON; --human for table)"},
+            {"command": "launch --name <label> --brief-file <path> [--split right|bottom|left|top|spawn] [--percent N] [--cwd <dir>] [--model <model>]",
+             "summary": "split current pane (right/bottom/left/top, optionally --percent 10..90) or spawn a new window"},
+            {"command": "send --pane-id <id> --text <text> [--require-idle] [--force]",
+             "summary": "fenced send+Enter to a pi pane; refuses protected/non-pi panes unless forced"},
+            {"command": "status [--dispatch <dir>] [--human] | status --tail <pane-id> [--lines N]",
+             "summary": "team worker status from dispatch dirs, or tail a pane's recent text"},
+            {"command": "focus --pane-id <id> [--force]",
+             "summary": "bring a pane to the foreground; refuses pane 0/current unless forced"},
+            {"command": "cleanup --pattern <regex> [--confirm]",
+             "summary": "dry-run by default; kill stale panes only with --confirm"},
+            {"command": "launch-and-dispatch --name <n> --brief-file <p> --dispatch-instruction <t>",
+             "summary": "launch a worker then send its dispatch instruction"},
+        ],
+    }
+
+
+def build_parser():
+    parser = CliParser(
+        prog="pi-team-pane",
+        description="Split WezTerm panes, launch named pi agents (team.ts), steer/monitor them, "
+                    "and clean up stale team panes safely. JSON output by default; --human for tables.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--brief", action="store_true", help="print CLI identity and exit")
+    parser.add_argument("--version", action="store_true", help="print version and exit")
+    sub = parser.add_subparsers(dest="command", metavar="<command>", title="commands")
+
+    p_list = sub.add_parser("list", help="list live wezterm panes")
+    p_list.add_argument("--human", action="store_true", help="human-readable table")
+
+    p_launch = sub.add_parser("launch", help="split a pane and launch a named pi agent")
+    p_launch.add_argument("--name", required=True, help="worker label (used in pane title)")
+    p_launch.add_argument("--brief-file", required=True, help="path to the brief file for the worker")
+    p_launch.add_argument("--split", choices=["right", "bottom", "left", "top", "spawn"], default="bottom",
+                          help="right/bottom/left/top split of current pane, or spawn a new window")
+    p_launch.add_argument("--percent", type=percent_int, default=None,
+                          help="split size as a percentage of available space (10..90; split panes only)")
+    p_launch.add_argument("--cwd", default=os.getcwd(), help="working directory for the worker (default: current dir)")
+    p_launch.add_argument("--model", default=MODEL_DEFAULT, help="pi model (default: %(default)s)")
+    p_launch.add_argument("--extension", default=EXTENSION_DEFAULT, help="pi extension (default: %(default)s)")
+
+    p_send = sub.add_parser("send", help="fenced send+Enter to a pi pane")
+    p_send.add_argument("--pane-id", type=int, required=True, help="target pane id")
+    p_send.add_argument("--text", required=True, help="text to send (never echoed)")
+    p_send.add_argument("--require-idle", action="store_true",
+                        help="refuse unless recent pane text looks idle/ready")
+    p_send.add_argument("--force", action="store_true",
+                        help="override protected/current/non-pi/require-idle refusals deliberately")
+
+    p_focus = sub.add_parser("focus", help="bring a pane to the foreground")
+    p_focus.add_argument("--pane-id", type=int, required=True, help="target pane id")
+    p_focus.add_argument("--force", action="store_true",
+                         help="override pane 0/current refusals deliberately")
+
+    p_status = sub.add_parser("status", help="show team worker status from dispatch dirs")
+    p_status.add_argument("--dispatch", help="specific dispatch dir (default: newest dispatch-* under status root)")
+    p_status.add_argument("--status-root", default=STATUS_ROOT_DEFAULT, help="status root (default: %(default)s)")
+    p_status.add_argument("--tail", type=int, metavar="PANE_ID", default=None,
+                          help="read a pane's recent text instead of dispatch status")
+    p_status.add_argument("--lines", type=int, default=30,
+                          help="tail line count (capped at 200; default: 30)")
+    p_status.add_argument("--human", action="store_true", help="human-readable summary")
+
+    p_cleanup = sub.add_parser("cleanup", help="clean stale panes by title regex (dry-run by default)")
+    p_cleanup.add_argument("--pattern", required=True, help="regex matched against pane title/label")
+    p_cleanup.add_argument("--dry-run", action="store_true", help="explicit dry run (default mode)")
+    p_cleanup.add_argument("--confirm", action="store_true", help="actually kill matched panes")
+    p_cleanup.add_argument("--force", action="store_true",
+                           help="allow matching non-pi panes; pane 0/current/last-pane protection remains absolute")
+    p_cleanup.add_argument("--human", action="store_true", help="human-readable listing")
+
+    p_lad = sub.add_parser("launch-and-dispatch", help="launch a named pi agent, then send its dispatch instruction")
+    p_lad.add_argument("--name", required=True, help="worker label")
+    p_lad.add_argument("--brief-file", required=True, help="path to the brief file for the worker")
+    p_lad.add_argument("--dispatch-instruction", required=True, help="instruction text sent to the new worker")
+    p_lad.add_argument("--split", choices=["right", "bottom", "left", "top", "spawn"], default="bottom")
+    p_lad.add_argument("--percent", type=percent_int, default=None,
+                       help="split size as a percentage of available space (10..90; split panes only)")
+    p_lad.add_argument("--cwd", default=os.getcwd())
+    p_lad.add_argument("--model", default=MODEL_DEFAULT)
+    p_lad.add_argument("--extension", default=EXTENSION_DEFAULT)
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "version", False):
+        emit({"name": "pi-team-pane", "version": VERSION})
+        return 0
+    if getattr(args, "brief", False) or not getattr(args, "command", None):
+        emit(brief_payload())  # bare invocation == --brief
+        return 0
+    {"list": cmd_list, "launch": cmd_launch, "send": cmd_send, "status": cmd_status,
+     "focus": cmd_focus, "cleanup": cmd_cleanup, "launch-and-dispatch": cmd_launch_dispatch}[args.command](args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
