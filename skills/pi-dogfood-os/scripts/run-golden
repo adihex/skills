@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""run-golden — interactive golden-scenario runner (ship gate).
+
+Parses the golden scenario list from references/golden-scenarios.md (single source
+of truth), prompts for a result + evidence per scenario, and appends PASS/FAIL rows
+to a dogfood log. Exits 1 if any scenario is FAIL (blocks ship), 0 otherwise.
+
+Usage:
+  run-golden [--log FILE] [--subset G1,G4,G8|G1-G4,G8] [--dry-run]
+
+Defaults: log = $DOGFOOD_LOG or ./dogfood-log.md. --subset runs only the named
+scenarios and supports inclusive ranges (e.g., the critical subset G1-G4,G8).
+Unknown or malformed subset entries fail closed with exit 2. --dry-run prints the
+rows without writing. SKIP is allowed and does not block ship (use it honestly — a
+skipped gate means "not gated yet").
+"""
+import argparse
+import os
+import re
+import sys
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCENARIOS_MD = os.path.join(SKILL_DIR, "references", "golden-scenarios.md")
+DEFAULT_LOG = os.environ.get("DOGFOOD_LOG", os.path.join(os.getcwd(), "dogfood-log.md"))
+
+
+def ask(prompt, default=""):
+    """input() that degrades gracefully when stdin is not a tty or is exhausted."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return default
+
+
+def parse_scenarios(path):
+    """Return [(id, title, intent)] from '## G<n> — <title>' headings."""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        print(f"run-golden: cannot read {path}", file=sys.stderr)
+        sys.exit(2)
+    for line in lines:
+        m = re.match(r"^##\s+(G\d+)\s*[—-]\s*(.+)", line.strip())
+        if m:
+            out.append((m.group(1), m.group(2).strip()))
+    return out
+
+
+def parse_subset(expr, available_ids):
+    """Expand a comma-separated subset like 'G1,G3-G5' and fail on unknowns."""
+    available = set(available_ids)
+    selected = []
+    invalid = []
+    unknown = []
+
+    for raw_part in expr.split(","):
+        part = raw_part.strip().upper()
+        if not part:
+            invalid.append(raw_part or "<empty>")
+            continue
+        m = re.fullmatch(r"G(\d+)(?:\s*-\s*G?(\d+))?", part)
+        if not m:
+            invalid.append(raw_part.strip())
+            continue
+        start = int(m.group(1))
+        end = int(m.group(2) or m.group(1))
+        if end < start:
+            invalid.append(raw_part.strip())
+            continue
+        for num in range(start, end + 1):
+            sid = f"G{num}"
+            if sid not in available:
+                unknown.append(sid)
+            elif sid not in selected:
+                selected.append(sid)
+
+    if invalid or unknown:
+        details = []
+        if invalid:
+            details.append("invalid entries: " + ", ".join(invalid))
+        if unknown:
+            details.append("unknown scenarios: " + ", ".join(dict.fromkeys(unknown)))
+        raise ValueError("; ".join(details))
+    if not selected:
+        raise ValueError("empty --subset; expected scenario ids like G1 or ranges like G1-G4")
+    return set(selected)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Golden scenario ship gate")
+    ap.add_argument("--log", default=DEFAULT_LOG)
+    ap.add_argument("--subset", default=None, help="comma list/ranges of scenarios, e.g. G1,G4,G8 or G1-G4,G8")
+    ap.add_argument("--dry-run", action="store_true", help="print rows without writing")
+    args = ap.parse_args()
+
+    scenarios = parse_scenarios(SCENARIOS_MD)
+    if not scenarios:
+        print("run-golden: no G-scenarios parsed", file=sys.stderr)
+        sys.exit(2)
+    if args.subset:
+        try:
+            wanted = parse_subset(args.subset, [sid for sid, _ in scenarios])
+        except ValueError as exc:
+            print(f"run-golden: invalid --subset: {exc}", file=sys.stderr)
+            sys.exit(2)
+        scenarios = [s for s in scenarios if s[0] in wanted]
+
+    print(f"Golden ship gate — {len(scenarios)} scenarios (log: {args.log})")
+    rows, fails = [], 0
+    for sid, title in scenarios:
+        result = ""
+        for _ in range(3):  # re-prompt on invalid input, then default SKIP
+            result = ask(f"[{sid}] {title}\n  result (PASS/FAIL/SKIP) [skip]: ").strip().upper() or "SKIP"
+            if result in ("PASS", "FAIL", "SKIP"):
+                break
+            print(f"  invalid '{result}' — expected PASS, FAIL or SKIP")
+        evidence = ""
+        if result in ("PASS", "FAIL"):
+            evidence = ask("  evidence path (optional): ").strip()
+        if result == "FAIL":
+            fails += 1
+        rows.append((sid, result, evidence))
+        print(f"  -> {result}" + (f"  ({evidence})" if evidence else ""))
+
+    line = (f"- Golden rerun {os.path.basename(args.log) or args.log}: "
+            + ", ".join(f"{sid}={res}" for sid, res, _ in rows))
+    print("\n" + line)
+    if not args.dry_run:
+        with open(args.log, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    if fails:
+        print(f"\nSHIP GATE BLOCKED: {fails} FAIL scenario(s). Fix before shipping (operating-model decision rule 2).")
+        sys.exit(1)
+    print("\nShip gate: all scenarios passed or skipped." if rows else "\nShip gate: nothing run.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

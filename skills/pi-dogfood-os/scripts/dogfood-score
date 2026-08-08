@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""dogfood-score — compute the pi dogfooding scorecard from dispatch status JSONs.
+
+Reads each dispatch-*/_dispatch.json plus per-worker JSON files (worker-*.json or
+agent-*.json) under a status dir and emits the automatable subset of the scorecard:
+activation (if --hours given), completion/failure/abort-share, fully-green dispatch
+rate, latency stats, and turns-at-abort stats.
+
+Usage:
+  dogfood-score [STATUS_DIR] [--hours H] [--json] [--log FILE]
+
+Defaults: STATUS_DIR = $DOGFOOD_STATUS_DIR or /tmp/team-task/status.
+With --log FILE, appends a one-line scorecard summary to the dogfood log.
+"""
+import argparse
+import json
+import os
+import statistics
+import sys
+
+DEFAULT_DIR = os.environ.get("DOGFOOD_STATUS_DIR", "/tmp/team-task/status")
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def discover_dispatches(status_dir):
+    """Return a list of dispatch dirs, sorted."""
+    if not os.path.isdir(status_dir):
+        print(f"dogfood-score: status dir not found: {status_dir}", file=sys.stderr)
+        sys.exit(2)
+    return sorted(
+        d for d in os.listdir(status_dir)
+        if d.startswith("dispatch-") and os.path.isdir(os.path.join(status_dir, d))
+    )
+
+
+MANIFEST_NAMES = {"_dispatch.json", "agent-_dispatch.json"}
+
+
+def worker_records(dispatch_dir):
+    """Yield per-worker dicts from every worker JSON in a dispatch dir.
+
+    Covers worker-*.json, agent-*.json and bare-name worker files (older
+    dispatches mix all three). Excludes the dispatch manifest and the stray
+    agent-_dispatch.json copies of it seen in the seed data.
+    """
+    files = sorted(
+        f for f in os.listdir(dispatch_dir)
+        if f.endswith(".json") and f not in MANIFEST_NAMES
+    )
+    for f in files:
+        rec = read_json(os.path.join(dispatch_dir, f))
+        if rec and isinstance(rec, dict):
+            rec["_file"] = f
+            yield rec
+
+
+def dedupe_workers(recs):
+    """Dedupe per-worker records by label, preferring one with activity detail.
+
+    The seed data stores the same worker under both agent-<label>.json and
+    <label>.json (identical content); prefer the record that carries activity/
+    turn fields if only one does.
+    """
+    by_label = {}
+    for r in recs:
+        label = r.get("label") or os.path.splitext(r["_file"])[0]
+        cur = by_label.get(label)
+        if cur is None or (r.get("activity") and not cur.get("activity")):
+            by_label[label] = r
+    return by_label
+
+
+def summarize(status_dir):
+    dispatches = discover_dispatches(status_dir)
+    rows = []
+    for name in dispatches:
+        d = read_json(os.path.join(status_dir, name, "_dispatch.json")) or {}
+        by_label = dedupe_workers(worker_records(os.path.join(status_dir, name)))
+        # Per-worker JSON files carry the most accurate status/activity/turn;
+        # _dispatch.json's worker list is the fallback when no worker file exists.
+        ws = []
+        for w in d.get("workers", []):
+            label = w.get("label", "")
+            r = by_label.get(label)
+            if r:
+                ws.append({
+                    "label": label,
+                    "status": r.get("status") or w.get("status"),
+                    "activity": r.get("activity"),
+                    "turn": r.get("turn"),
+                })
+            else:
+                ws.append({"label": label, "status": w.get("status"), "activity": None, "turn": None})
+        rows.append({
+            "name": name,
+            "status": d.get("status", "unknown"),
+            "mode": d.get("mode", "?"),
+            "elapsedMs": d.get("elapsedMs"),
+            "workers": ws,
+        })
+    return rows
+
+
+def metrics(rows, hours=None):
+    completed = [r for r in rows if r.get("status") == "completed"]
+    running = [r for r in rows if r.get("status") == "running"]
+    finished = [w for r in rows for w in r["workers"] if w.get("status") in ("done", "failed")]
+    done = [w for w in finished if w.get("status") == "done"]
+    failed = [w for w in finished if w.get("status") == "failed"]
+    aborted = [w for w in finished if w.get("activity") == "aborted"]
+    green = [r for r in completed if not any(w.get("status") == "failed" for w in r["workers"])]
+    elapsed = sorted(r["elapsedMs"] for r in completed if r.get("elapsedMs"))
+    aborted_turns = sorted(w["turn"] for w in aborted if w.get("turn"))
+
+    m = {
+        "dispatches": len(rows),
+        "completed": len(completed),
+        "running": len(running),
+        "workers_finished": len(finished),
+        "workers_done": len(done),
+        "workers_failed": len(failed),
+        "workers_aborted": len(aborted),
+    }
+    if hours:
+        m["activation_per_hour"] = round(len(rows) / hours, 2) if hours > 0 else None
+    m["completion_rate_pct"] = round(100 * len(done) / len(finished), 1) if finished else None
+    m["failure_rate_pct"] = round(100 * len(failed) / len(finished), 1) if finished else None
+    m["abort_share_of_failures_pct"] = round(100 * len(aborted) / len(failed), 1) if failed else None
+    m["green_dispatch_rate_pct"] = round(100 * len(green) / len(completed), 1) if completed else None
+    if elapsed:
+        m["elapsed_ms"] = {
+            "median": round(statistics.median(elapsed)),
+            "mean": round(statistics.mean(elapsed)),
+            "min": elapsed[0],
+            "max": elapsed[-1],
+        }
+    if aborted_turns:
+        m["turns_at_abort"] = {
+            "median": round(statistics.median(aborted_turns)),
+            "mean": round(statistics.mean(aborted_turns), 1),
+            "max": aborted_turns[-1],
+        }
+    return m
+
+
+def render_human(m):
+    lines = ["pi-dogfood scorecard"]
+    lines.append(f"  dispatches: {m['dispatches']} ({m['completed']} completed, {m['running']} running)")
+    if "activation_per_hour" in m:
+        lines.append(f"  activation: {m['activation_per_hour']}/h")
+    lines.append(f"  workers finished: {m['workers_finished']} (done {m['workers_done']}, failed {m['workers_failed']})")
+    for k, label in [("completion_rate_pct", "completion rate"), ("failure_rate_pct", "failure rate"),
+                     ("abort_share_of_failures_pct", "abort share of failures"),
+                     ("green_dispatch_rate_pct", "fully-green dispatch rate")]:
+        if m.get(k) is not None:
+            lines.append(f"  {label}: {m[k]}%")
+    if "elapsed_ms" in m:
+        e = m["elapsed_ms"]
+        lines.append(f"  elapsed ms: median {e['median']} · mean {e['mean']} · min {e['min']} · max {e['max']}")
+    if "turns_at_abort" in m:
+        t = m["turns_at_abort"]
+        lines.append(f"  turns at abort: median {t['median']} · mean {t['mean']} · max {t['max']}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Scorecard from pi dispatch status JSONs")
+    ap.add_argument("status_dir", nargs="?", default=DEFAULT_DIR)
+    ap.add_argument("--hours", type=float, default=None, help="window hours for activation rate")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--log", metavar="FILE", default=None, help="append one-line summary to a dogfood log")
+    args = ap.parse_args()
+
+    rows = summarize(args.status_dir)
+    if not rows:
+        print(f"dogfood-score: no dispatch-* dirs found under {args.status_dir}", file=sys.stderr)
+        sys.exit(1)
+    m = metrics(rows, hours=args.hours)
+
+    if args.json:
+        print(json.dumps(m, indent=2))
+    else:
+        print(render_human(m))
+
+    if args.log:
+        line = (f"- Scorecard {m['dispatches']} dispatches: done {m['workers_done']}/{m['workers_finished']} "
+                f"({m.get('completion_rate_pct')}%) · green {m.get('green_dispatch_rate_pct')}% · "
+                f"abort share {m.get('abort_share_of_failures_pct')}%")
+        with open(args.log, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+if __name__ == "__main__":
+    main()
