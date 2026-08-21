@@ -35,6 +35,17 @@ class DispatchPolicyTests(unittest.TestCase):
         self.assertTrue(result["admitted"])
         self.assertEqual(result["turn_budget"], 30)
 
+    def test_backend_specific_limits_and_quota_block(self):
+        policy = policy_module.DispatchPolicy()
+        self.assertEqual(policy.admit_backend(backend="hax", active_workers=0, setup_workers=0)["backend_limit"], 2)
+        with self.assertRaises(policy_module.DispatchRefused) as limit:
+            policy.admit_backend(backend="hax", active_workers=2, setup_workers=0)
+        self.assertEqual(limit.exception.code, "MAX_ACTIVE_HAX")
+        with self.assertRaises(policy_module.DispatchRefused) as quota:
+            policy.admit_backend(backend="hax", active_workers=0, setup_workers=0, quota_blocked=True)
+        self.assertEqual(quota.exception.code, "HAX_QUOTA_BLOCKED")
+
+
 
 if __name__ == "__main__":
     unittest.main()

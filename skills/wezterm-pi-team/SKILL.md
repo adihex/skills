@@ -15,6 +15,7 @@ date_added: 2026-08-01
 - WezTerm with the `wezterm cli` surface for `list`, `split-pane`/`spawn`, `send-text`, `get-text`, and `kill-pane`; this is the minimum supported CLI surface.
 - Pi and the team extension installed from their official distributions.
 - Run inside a WezTerm pane with `WEZTERM_PANE` set. Set `WEZTERM_CLASS` when using a non-default mux class.
+- Hax 0.3.0+ and the official Codex CLI are optional. Hax uses `codex login`, requires an explicit provider/model, and is never selected automatically.
 - Add `skills/wezterm-pi-team/scripts` to `PATH`, or invoke `pi-team-pane` by path.
 
 ## Workflow and identity
@@ -25,15 +26,23 @@ date_added: 2026-08-01
 4. `status` joins live pane identity with static dispatch records. It never infers completion from pane text.
 5. Complete workers require a report plus clean Git, pushed SHA, review, and checks evidence. Native pane idle is not completion.
 
+## Backend selection
+
+Pi remains the default. Hax is explicit opt-in with `--backend hax`, `--provider codex`, `--model MODEL`, and optional `--effort`/`--mode`. The shared backend starts Hax in the worker pane, waits for readiness, and uses the existing `get-text` fence before a separate Enter. One-shot mode is direct and non-steerable. Missing Hax, auth, model, version, and quota have specific blocker codes; HTTP 429 is `blocked_external`, never success, and never silently falls back to Pi.
+
+Use [references/hax-backend.md](references/hax-backend.md) for setup, diagnostics, common completion, and cleanup details. Backend, runtime, provider, model, effort, mode, auth source, capabilities, and safe backend errors are recorded in manifests.
+
 ## Command index
 
 ```text
 pi-team-pane list [--human]
-pi-team-pane launch --name LABEL --brief-file FILE [--split right|bottom|left|top|spawn]
+pi-team-pane launch --name LABEL --brief-file FILE [--backend pi|hax --provider codex --model MODEL --effort high --mode interactive|oneshot] [--split right|bottom|left|top|spawn]
 pi-team-pane send --pane-id ID --text TEXT [--require-idle]
 pi-team-pane status [--status-root DIR] [--dispatch DIR]
 pi-team-pane status --tail PANE --lines N
 pi-team-pane cleanup --pattern REGEX [--confirm]
+pi-team-pane doctor --backend hax --provider codex --model MODEL
+pi-team-pane complete --manifest FILE --report FILE --repository OWNER/REPO
 ```
 
 JSON is the default. Exit `0` is success, `1` usage, `2` WezTerm/runtime failure, and `3` safety refusal. Cleanup is dry-run unless `--confirm` is supplied. Pane 0, the current pane, the last pane in a window, and non-Pi panes are protected.

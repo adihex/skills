@@ -35,6 +35,7 @@ State vocabulary and evidence rules: [references/state-model.md](references/stat
 
 ```text
 pi-team-herdr --session NAME list [--human]
+pi-team-herdr --session NAME doctor --backend hax [--model MODEL]
 pi-team-herdr --session NAME launch --name LABEL --brief-file FILE [--manifest FILE]
 pi-team-herdr --session NAME send --manifest FILE --text TEXT
 pi-team-herdr --session NAME status --manifest FILE
@@ -46,6 +47,19 @@ pi-team-herdr watch --manifest-dir DIR --run-id ID --worktree-root ROOT --main-c
 ```
 
 All commands emit JSON by default. Exit `0` means the operation passed; `1` is usage; `2` is an unavailable/failed dependency; `3` is a safety refusal. `cleanup` is dry-run unless `--confirm` is present. `watch` is bounded to the supplied run ID and stops when no tracked workers remain.
+## Backend selection
+
+Pi is the default and keeps Herdr's native Pi agent path. Hax is never auto-selected; opt in explicitly:
+
+```text
+pi-team-herdr launch --name LABEL --backend hax --provider codex --model MODEL --effort high --brief-file FILE
+```
+
+Herdr has no native Hax agent kind. The Hax adapter starts the explicit Hax command in the recorded Herdr pane, waits for readiness, then uses Herdr's literal send plus separate Enter and readback path. Use `--mode oneshot` only when live steering is not needed; its stdout/stderr and exit classification are reported without marking the worker complete.
+
+Hax/Codex subscription setup uses `codex login`; no API key is required. `doctor --backend hax` reports only installation, auth presence, provider, model configuration, and quota status. It never prints credential contents. Missing Hax, Codex auth, model, unsupported version, HTTP 401/403, HTTP 429, and network timeout have distinct blocker codes. HTTP 429 is `blocked_external`, not success, and Hax never silently falls back to Pi.
+
+Backend, runtime, provider, model, effort, mode, auth source, capabilities, and backend error/session fields are recorded in the manifest. Completion still uses the shared Git, push, review, checks, report, and cleanup gates.
 
 ## Safety rules
 
@@ -66,7 +80,7 @@ All commands emit JSON by default. Exit `0` means the operation passed; `1` is u
 - `scripts/manifest_store.py`: locked atomic writes, append-only events, and redaction.
 - `scripts/git_gate.py`: Git/PR/review/check evidence and external blocker classification.
 - `scripts/cleanup.py`: dry-run planning, ownership guards, transactional teardown, and watcher lock.
-- `scripts/dispatch_policy.py`: maximum four active workers, setup backpressure, stagger, turn, wall-clock, and memory limits.
+- `scripts/dispatch_policy.py`: maximum four active workers, Hax/Codex subscription limits of two, setup backpressure, stagger, turn, wall-clock, and memory limits.
 
 ## Common failures
 

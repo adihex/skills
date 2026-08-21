@@ -7,7 +7,8 @@ A small set of Pi-compatible skills for visible workers, lifecycle evidence, and
 - Python 3.10+ (standard library only for bundled scripts).
 - Git 2.30+ for worktree and push evidence.
 - Pi and its team extension, installed from their official distributions.
-- Optional backends: Herdr, Fut, tmux, and WezTerm. Each skill checks its backend before side effects.
+- Optional backends: Herdr, Fut, tmux, WezTerm, and Hax. Each skill checks its selected backend before side effects.
+- Hax subscription mode uses the official Codex CLI and `codex login`; no API key is required.
 - Cleanup process identity checks use `ps` and `lsof`.
 
 The repository does not bundle Herdr, Fut, Pi, GitHub CLI, or a network service. Install those from their official project instructions and verify with `<command> --version`. Use fake executables in `tests/fixtures/` for offline development.
@@ -31,11 +32,26 @@ python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s skills/herdr-pi-team/tests -v
 python3 -m compileall -q skills scripts tests
 python3 skills/pi-dogfood-os/scripts/run-golden --all --json
+python3 skills/pi-dogfood-os/scripts/run-hax-golden --json
 python3 -m compileall -q skills scripts tests
 git diff --check
 ```
 
 The golden gate runs G1–G10 against fake Herdr/Git/GitHub commands and disposable temporary Git repositories. It never requires GitHub authentication or deletes a real checkout. A failed scenario blocks release.
+## Hax backend
+
+Pi remains the default in every runtime. Hax is explicit opt-in and uses one shared backend with thin runtime adapters:
+
+```text
+codex login
+pi-team-herdr launch --name review-worker --backend hax --provider codex --model MODEL --effort high --brief-file FILE
+pi-team-tmux launch --name review-worker --backend hax --provider codex --model MODEL --effort high --brief-file FILE
+pi-team-pane launch --name review-worker --backend hax --provider codex --model MODEL --effort high --brief-file FILE
+```
+
+Use `--mode oneshot` only when steering is unnecessary. Hax readiness, literal send, Enter submission, manifest state, Git/review/check gates, and cleanup remain runtime-specific but evidence-gated. HTTP 429 is external quota exhaustion and never triggers a silent fallback to Pi. Run `doctor --backend hax` for safe capability diagnostics; credential contents are never printed or persisted.
+
+`run-hax-golden` runs H1–H13 with fake Hax, Herdr, tmux, WezTerm, Git, and GitHub commands. It never calls a live subscription.
 
 ## Optional integration checks
 

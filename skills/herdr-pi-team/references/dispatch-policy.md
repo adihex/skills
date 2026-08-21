@@ -1,8 +1,9 @@
 # Dispatch policy
 
 The default policy is bounded and applies before launching a worker:
-
-- Maximum active workers: **4**.
+- Maximum active Pi workers: **4**.
+- Maximum active Hax workers: **2**.
+- Maximum active Codex-subscription workers: **2**.
 - Setup concurrency: **2**.
 - Launch stagger: **1 second** between planned launches.
 - Default worker turn budget: **30 turns**.

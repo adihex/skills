@@ -56,9 +56,24 @@ def branch_for(cwd: str) -> str:
 
 
 def adapter(args):
-    return adapter_module.HerdrAdapter(session=args.session, herdr_command=args.herdr_command,
-                                       pi_command=args.pi_command, extension=args.extension,
-                                       timeout=args.timeout, poll_interval=args.poll_interval)
+    config = {"backend": getattr(args, "backend", "pi")}
+    if getattr(args, "command", None) in {"send", "status"} and getattr(args, "manifest", None):
+        saved = store_module.ManifestStore.from_path(args.manifest).read() or {}
+        if saved.get("backend"):
+            config["backend"] = saved["backend"]
+            config.update(saved.get("backend_config") or {})
+    for key in ("provider", "model", "effort", "mode", "auth_source", "hax_min_version"):
+        value = getattr(args, key, None)
+        if value is not None and key not in config:
+            config[key] = value
+    try:
+        return adapter_module.HerdrAdapter(session=args.session, herdr_command=args.herdr_command,
+                                           pi_command=args.pi_command, extension=args.extension,
+                                           timeout=args.timeout, poll_interval=args.poll_interval,
+                                           backend_config=config, hax_command=args.hax_command,
+                                           codex_command=args.codex_command, auth_path=args.auth_path)
+    except (adapter_module.hax_backend.HaxConfigError, adapter_module.hax_backend.HaxPreflightError) as exc:
+        raise adapter_module.AdapterError(getattr(exc, "code", "HAX_CONFIG_INVALID"), str(exc), details=getattr(exc, "details", {})) from exc
 
 
 def read_manifest(path: str):
@@ -112,6 +127,16 @@ def completion_evidence(args, manifest, report_path):
 def main(argv=None):
     parser = Parser(prog=NAME)
     parser.add_argument("--session", help="one session name used for every Herdr command")
+    parser.add_argument("--backend", choices=["pi", "hax"], default="pi")
+    parser.add_argument("--provider", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--model", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--effort", choices=["default", "none", "low", "medium", "high", "xhigh", "max"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--mode", choices=["interactive", "oneshot"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--auth-source", dest="auth_source", choices=["codex_cli", "hax_managed"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--hax-min-version", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--hax-command", default="hax", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-command", default="codex", help=argparse.SUPPRESS)
+    parser.add_argument("--auth-path", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--herdr-command", default="herdr", help=argparse.SUPPRESS)
     parser.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
     parser.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
@@ -125,6 +150,17 @@ def main(argv=None):
 
     list_parser = sub.add_parser("list")
     list_parser.add_argument("--human", action="store_true")
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--backend", choices=["pi", "hax"], default=argparse.SUPPRESS)
+    doctor.add_argument("--provider", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--model", default="__doctor_missing__", help=argparse.SUPPRESS)
+    doctor.add_argument("--effort", choices=["default", "none", "low", "medium", "high", "xhigh", "max"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--mode", choices=["interactive", "oneshot"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--auth-source", dest="auth_source", choices=["codex_cli", "hax_managed"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--hax-min-version", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--hax-command", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--codex-command", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    doctor.add_argument("--auth-path", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     launch = sub.add_parser("launch")
     launch.add_argument("--name", required=True)
@@ -135,8 +171,18 @@ def main(argv=None):
     launch.add_argument("--branch", default=None)
     launch.add_argument("--workspace", default=None)
     launch.add_argument("--manifest", default=None)
-    launch.add_argument("--model", default="opencode/deepseek-v4-flash-free")
+    launch.add_argument("--backend", choices=["pi", "hax"], default=argparse.SUPPRESS)
+    launch.add_argument("--provider", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--model", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--effort", choices=["default", "none", "low", "medium", "high", "xhigh", "max"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--mode", choices=["interactive", "oneshot"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--auth-source", dest="auth_source", choices=["codex_cli", "hax_managed"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--hax-min-version", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--hax-command", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--codex-command", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    launch.add_argument("--auth-path", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     launch.add_argument("--thinking", choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+
     launch.add_argument("--setup-timeout", type=float, default=30.0)
 
     send = sub.add_parser("send")
@@ -188,10 +234,18 @@ def main(argv=None):
         emit({"name": NAME, "version": VERSION})
         return
     if args.brief or not args.command:
-        emit({"name": NAME, "version": VERSION, "backend": "herdr", "commands": ["list", "launch", "send", "status", "reconcile", "cleanup", "watch"], "session": "--session NAME is mandatory for named-session operations"})
+        emit({"name": NAME, "version": VERSION, "backend": "herdr", "default_backend": "pi", "backends": ["pi", "hax"], "commands": ["list", "launch", "send", "status", "doctor", "reconcile", "complete", "cleanup", "watch"], "session": "--session NAME is mandatory for named-session operations"})
         return
     try:
         mux = adapter(args)
+        if args.command == "doctor":
+            payload = {"backend": mux.config.backend, "runtime": "herdr", "capabilities": mux.hax.capabilities(mux.config, runtime="herdr")}
+            if mux.config.backend == "hax":
+                payload["diagnostics"] = mux.hax.diagnostics(mux.config, runtime="herdr")
+            else:
+                payload["default"] = True
+            emit(payload)
+            return
         if args.command == "complete":
             manifest = read_manifest(args.manifest)
             evidence, details = completion_evidence(args, manifest, args.report)
@@ -246,11 +300,14 @@ def main(argv=None):
             run_id = args.run_id or f"run-{int(time.time())}"
             value = mux.launch(run_id=run_id, label=args.name, cwd=cwd, worktree=worktree,
                                branch=args.branch or branch_for(cwd), brief_file=args.brief_file,
-                               workspace_id=args.workspace, model=args.model, thinking=args.thinking,
+                               workspace_id=args.workspace, model=args.model or "opencode/deepseek-v4-flash-free", thinking=args.thinking,
                                setup_timeout=args.setup_timeout)
             value["session"] = args.session
             value["herdr_command"] = args.herdr_command
+            backend_output = value.pop("_backend_output", None)
             write_manifest(args.manifest, value)
+            if backend_output:
+                value["backend_output"] = backend_output
             emit(value)
             return
         if args.command == "reconcile":

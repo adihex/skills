@@ -1,70 +1,378 @@
 #!/usr/bin/env python3
-"""Safe JSON-first tmux wrapper for visible pi team panes (stdlib only)."""
+"""Safe JSON-first tmux worker runtime with Pi default and explicit Hax opt-in."""
+from __future__ import annotations
+
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
-NAME='pi-team-tmux';VERSION='0.1.0';PREFIX='π - ';MODEL='opencode/deepseek-v4-flash-free';EXT='~/.pi/agent/extensions/team.ts'
-def emit(x):print(json.dumps(x,ensure_ascii=False))
-def fail(n,c,m,s):print(json.dumps({'error':True,'code':c,'message':m,'suggestion':s}),file=sys.stderr);raise SystemExit(n)
-class P(argparse.ArgumentParser):
- def error(self,m):fail(1,'USAGE',m,'run --help')
-def run(a):
- try:return subprocess.run(['tmux']+a,capture_output=True,text=True,timeout=20)
- except FileNotFoundError:fail(2,'MUX_UNAVAILABLE','tmux binary not found','install tmux')
- except subprocess.TimeoutExpired:fail(2,'MUX_TIMEOUT','tmux command timed out','check tmux server')
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+SHARED_PATH = ROOT / "scripts" / "hax_backend.py"
+SPEC = importlib.util.spec_from_file_location("shared_hax_backend_tmux", SHARED_PATH)
+if SPEC is None or SPEC.loader is None:
+    raise ImportError(f"shared Hax backend is unavailable: {SHARED_PATH}")
+hax_backend = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = hax_backend
+SPEC.loader.exec_module(hax_backend)
+
+NAME = "pi-team-tmux"
+VERSION = "0.2.0"
+PREFIX = "π - "
+MODEL = "opencode/deepseek-v4-flash-free"
+EXT = "~/.pi/agent/extensions/team.ts"
+MANIFEST_ROOT = Path("/tmp/team-task/manifests")
+
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def fail(code, error_code, message, suggestion=None):
+    value = {"error": True, "code": error_code, "message": message}
+    if suggestion:
+        value["suggestion"] = suggestion
+    print(json.dumps(value, ensure_ascii=False), file=sys.stderr)
+    raise SystemExit(code)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        fail(1, "USAGE", message, "run pi-team-tmux --help")
+
+
+def run(args):
+    command = os.environ.get("PI_TEAM_TMUX_COMMAND", "tmux")
+    try:
+        return subprocess.run([command] + args, capture_output=True, text=True, timeout=20, shell=False)
+    except FileNotFoundError:
+        fail(2, "MUX_UNAVAILABLE", "tmux binary not found", "install tmux")
+    except subprocess.TimeoutExpired:
+        fail(2, "MUX_TIMEOUT", "tmux command timed out", "check tmux server")
+
+
 def panes():
- q=run(['list-panes','-a','-F','#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}\t#{pane_current_command}'])
- if q.returncode:fail(2,'MUX_UNAVAILABLE','tmux server is not running','start tmux with tmux new-session')
- o=[]
- for line in q.stdout.splitlines():
-  z=line.split('\t');title=z[4];o.append({'paneId':z[0],'session':z[1],'windowId':z[2],'windowIndex':z[3],'title':title,'command':z[5],'label':title[4:] if title.startswith(PREFIX) else None,'isPi':title.startswith(PREFIX)})
- return o
-def brief():return {'name':NAME,'version':VERSION,'backend':'tmux','purpose':'Manage named pi agents in tmux session/window/pane hierarchy safely.','commands':['list','launch','send','status','cleanup']}
+    result = run(["list-panes", "-a", "-F", "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_title}\t#{pane_current_command}"])
+    if result.returncode:
+        fail(2, "MUX_UNAVAILABLE", "tmux server is not running", "start tmux with tmux new-session")
+    rows = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t", 5)
+        if len(fields) != 6:
+            continue
+        pane_id, session, window_id, window_index, title, command = fields
+        rows.append({"paneId": pane_id, "session": session, "windowId": window_id, "windowIndex": window_index,
+                     "title": title, "command": command, "label": title[len(PREFIX):] if title.startswith(PREFIX) else None,
+                     "isPi": title.startswith(PREFIX)})
+    return rows
+
+
 def read_brief(path):
- try:
-  with open(path,'r',encoding='utf-8') as f:return f.read()
- except OSError as e:fail(2,'BRIEF_NOT_READABLE','brief file is not readable',str(e) or 'create the brief first')
-def main(v):
- p=P(prog=NAME);p.add_argument('--brief',action='store_true');p.add_argument('--version',action='store_true');s=p.add_subparsers(dest='cmd')
- x=s.add_parser('list');x.add_argument('--human',action='store_true')
- x=s.add_parser('launch');x.add_argument('--name',required=True);x.add_argument('--brief-file',required=True);x.add_argument('--cwd',default=os.getcwd());x.add_argument('--model',default=MODEL);x.add_argument('--extension',default=EXT);x.add_argument('--split',choices=['right','bottom','spawn'],default='bottom')
- x=s.add_parser('send');x.add_argument('--pane-id',required=True);x.add_argument('--text',required=True);x.add_argument('--require-idle',action='store_true');x.add_argument('--force',action='store_true')
- x=s.add_parser('status');x.add_argument('--human',action='store_true')
- x=s.add_parser('cleanup');x.add_argument('--pattern',required=True);x.add_argument('--dry-run',action='store_true');x.add_argument('--confirm',action='store_true');x.add_argument('--force',action='store_true')
- a=p.parse_args(v)
- if a.version:emit({'name':NAME,'version':VERSION});return
- if a.brief or not a.cmd:emit(brief());return
- ps=panes()
- if a.cmd=='list':emit({'panes':ps,'count':len(ps)}) if not a.human else print('\n'.join('%s  %s' %(z['paneId'],z['title']) for z in ps));return
- if a.cmd=='status':emit({'workers':[{'paneId':z['paneId'],'label':z['label']} for z in ps if z['isPi']]});return
- if a.cmd=='launch':
-  if not os.path.isfile(a.brief_file):fail(2,'BRIEF_NOT_READABLE','brief file is not readable','create the brief first')
-  brief_text=read_brief(a.brief_file)
-  cmd=shlex.join(['exec','pi','-e',os.path.expanduser(a.extension),'--model',a.model,'--name',a.name,brief_text])
-  if a.split=='spawn':q=run(['new-window','-P','-F','#{pane_id}','-n',PREFIX+a.name,'-c',os.path.abspath(a.cwd),cmd])
-  else:q=run(['split-window','-P','-F','#{pane_id}','-h' if a.split=='right' else '-v','-c',os.path.abspath(a.cwd),cmd])
-  if q.returncode:fail(2,'LAUNCH_FAILED',q.stderr.strip() or 'tmux launch failed','check tmux state')
-  pid=q.stdout.strip();run(['select-pane','-t',pid,'-T',PREFIX+a.name]);emit({'paneId':pid,'launched':True,'split':a.split,'title':PREFIX+a.name,'briefChars':len(brief_text)});return
- if a.cmd=='send':
-  z=next((z for z in ps if z['paneId']==a.pane_id),None)
-  if not z:fail(2,'NOT_FOUND','pane not found','run list')
-  if not z['isPi'] and not a.force:fail(3,'SAFETY_REFUSAL','refusing non-pi pane','use --force deliberately')
-  q=run(['send-keys','-t',a.pane_id,'-l',a.text]);q2=run(['send-keys','-t',a.pane_id,'Enter'])
-  if q.returncode or q2.returncode:fail(2,'SEND_FAILED',(q.stderr+q2.stderr).strip(),'check tmux target')
-  emit({'paneId':a.pane_id,'sent':True,'chars':len(a.text),'fenced':True});return
- try:rx=re.compile(a.pattern)
- except re.error as e:fail(1,'INVALID_PATTERN','cleanup pattern is not a valid regex',str(e))
- matches=[z for z in ps if rx.search(z['title'])]
- if a.dry_run or not a.confirm:emit({'dryRun':True,'pattern':a.pattern,'matches':matches,'killed':[]});return
- killed=[]
- for z in matches:
-  if not z['isPi'] and not a.force:continue
-  q=run(['kill-pane','-t',z['paneId']])
-  if q.returncode:fail(2,'CLEANUP_FAILED',q.stderr.strip() or 'tmux kill-pane failed','retry after checking tmux')
-  killed.append({'paneId':z['paneId'],'title':z['title']})
- emit({'dryRun':False,'pattern':a.pattern,'matches':matches,'killed':killed})
-if __name__=='__main__':main(sys.argv[1:])
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(2, "BRIEF_NOT_READABLE", "brief file is not readable", str(exc) or "create the brief first")
+
+
+def read_manifest(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        fail(2, "MANIFEST_UNREADABLE", "manifest is missing or invalid", "create the manifest with launch")
+
+
+def save_manifest(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def safe_manifest_path(args, label):
+    if args.manifest:
+        return Path(args.manifest)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "worker"
+    return Path(args.manifest_dir or MANIFEST_ROOT) / f"{safe}.json"
+
+
+def config_for(args, saved=None):
+    saved = saved or {}
+    config = {"backend": getattr(args, "backend", None) or saved.get("backend", "pi")}
+    config.update(saved.get("backend_config") or {})
+    for key in ("provider", "model", "effort", "mode", "auth_source", "hax_min_version"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+    return hax_backend.BackendConfig.from_mapping(config)
+
+
+def backend_for(args, saved=None):
+    try:
+        config = config_for(args, saved)
+    except hax_backend.HaxConfigError as exc:
+        fail(2, exc.code, str(exc), "provide a valid explicit backend configuration")
+    return hax_backend.HaxBackend(hax_command=args.hax_command, codex_command=args.codex_command, auth_path=args.auth_path), config
+
+
+def wait_ready(pane_id, timeout, poll):
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        result = run(["capture-pane", "-p", "-t", pane_id, "-S", "-20"])
+        if result.returncode == 0:
+            last = result.stdout
+            lowered = last.lower()
+            if any(marker in lowered for marker in ("ready", "ack", "❯", ">")):
+                return {"ready": True, "marker": "ready" if "ready" in lowered else "prompt"}
+        time.sleep(poll)
+    fail(2, "HAX_READINESS_TIMEOUT", "Hax did not expose a readiness marker", {"last_text_sha256": hashlib.sha256(last.encode()).hexdigest(), "last_text_chars": len(last)})
+
+
+def send_literal(pane_id, text):
+    first = run(["send-keys", "-t", pane_id, "-l", text])
+    second = run(["send-keys", "-t", pane_id, "Enter"])
+    if first.returncode or second.returncode:
+        fail(2, "SEND_FAILED", (first.stderr + second.stderr).strip(), "check tmux target")
+    return {"paneId": pane_id, "sent": True, "chars": len(text), "submitted": True, "fenced": False}
+
+
+def brief_payload():
+    return {"name": NAME, "version": VERSION, "runtime": "tmux", "default_backend": "pi",
+            "backends": ["pi", "hax"], "commands": ["list", "launch", "send", "status", "doctor", "complete", "reconcile", "cleanup"]}
+
+
+def add_backend_options(parser, *, suppress=False):
+    default = argparse.SUPPRESS if suppress else None
+    parser.add_argument("--backend", choices=["pi", "hax"], default=default)
+    parser.add_argument("--provider", default=default, help=argparse.SUPPRESS)
+    parser.add_argument("--model", default=default, help=argparse.SUPPRESS)
+    parser.add_argument("--effort", choices=["default", "none", "low", "medium", "high", "xhigh", "max"], default=default, help=argparse.SUPPRESS)
+    parser.add_argument("--mode", choices=["interactive", "oneshot"], default=default, help=argparse.SUPPRESS)
+    parser.add_argument("--auth-source", dest="auth_source", choices=["codex_cli", "hax_managed"], default=default, help=argparse.SUPPRESS)
+    parser.add_argument("--hax-min-version", default=default, help=argparse.SUPPRESS)
+    parser.add_argument("--hax-command", default=default if suppress else "hax", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-command", default=default if suppress else "codex", help=argparse.SUPPRESS)
+    parser.add_argument("--auth-path", default=default, help=argparse.SUPPRESS)
+def delegate_lifecycle(args):
+    cli = ROOT / "skills" / "herdr-pi-team" / "scripts" / "pi-team-herdr"
+    if args.cmd == "complete":
+        command = [sys.executable, str(cli), "--git-command", args.git_command, "--gh-command", args.gh_command, "complete", "--manifest", args.manifest, "--report", args.report, "--repository", args.repository]
+        if args.pr is not None:
+            command += ["--pr", str(args.pr)]
+    else:
+        command = [sys.executable, str(cli), "--git-command", args.git_command, "--gh-command", args.gh_command, "reconcile", "--run", args.run_id, "--manifest-dir", args.manifest_dir]
+        if args.report:
+            command += ["--report", args.report]
+    result = subprocess.run(command, capture_output=True, text=True, shell=False)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    raise SystemExit(result.returncode)
+
+
+
+def main(argv=None):
+    parser = Parser(prog=NAME)
+    parser.add_argument("--brief", action="store_true")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--hax-command", default="hax", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-command", default="codex", help=argparse.SUPPRESS)
+    parser.add_argument("--auth-path", default=None, help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="cmd")
+
+    listing = sub.add_parser("list")
+    listing.add_argument("--human", action="store_true")
+
+    launch = sub.add_parser("launch")
+    launch.add_argument("--name", required=True)
+    launch.add_argument("--brief-file", required=True)
+    launch.add_argument("--cwd", default=os.getcwd())
+    launch.add_argument("--split", choices=["right", "bottom", "spawn"], default="bottom")
+    launch.add_argument("--manifest", default=None)
+    launch.add_argument("--manifest-dir", default=None)
+    add_backend_options(launch, suppress=True)
+    launch.add_argument("--extension", default=EXT, help=argparse.SUPPRESS)
+
+    sending = sub.add_parser("send")
+    sending.add_argument("--pane-id", required=True)
+    sending.add_argument("--text", required=True)
+    sending.add_argument("--manifest", default=None)
+    sending.add_argument("--force", action="store_true")
+    add_backend_options(sending, suppress=True)
+
+    status = sub.add_parser("status")
+    status.add_argument("--human", action="store_true")
+    status.add_argument("--manifest", default=None)
+    status.add_argument("--manifest-dir", default=None)
+
+    doctor = sub.add_parser("doctor")
+    add_backend_options(doctor, suppress=True)
+
+    complete = sub.add_parser("complete")
+    complete.add_argument("--manifest", required=True)
+    complete.add_argument("--report", required=True)
+    complete.add_argument("--repository", required=True)
+    complete.add_argument("--pr", type=int, default=None)
+    complete.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
+    complete.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
+
+    reconcile = sub.add_parser("reconcile")
+    reconcile.add_argument("--run", dest="run_id", required=True)
+    reconcile.add_argument("--manifest-dir", required=True)
+    reconcile.add_argument("--report", default=None)
+    reconcile.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
+    reconcile.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
+    cleanup = sub.add_parser("cleanup")
+    cleanup.add_argument("--pattern", required=True)
+    cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument("--confirm", action="store_true")
+    cleanup.add_argument("--force", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.version:
+        emit({"name": NAME, "version": VERSION})
+        return
+    if args.brief or not args.cmd:
+        emit(brief_payload())
+        return
+    if args.cmd in {"complete", "reconcile"}:
+        delegate_lifecycle(args)
+
+
+    if args.cmd == "list":
+        result = panes()
+        if args.human:
+            print("\n".join(f"{row['paneId']}  {row['title']}" for row in result))
+        else:
+            emit({"panes": result, "count": len(result)})
+        return
+
+    if args.cmd == "doctor":
+        backend, config = backend_for(args)
+        if config.backend == "pi":
+            emit({"backend": "pi", "runtime": "tmux", "default": True, "capabilities": backend.capabilities(config, runtime="tmux")})
+            return
+        emit({"backend": "hax", "runtime": "tmux", "diagnostics": backend.diagnostics(config, runtime="tmux"), "capabilities": backend.capabilities(config, runtime="tmux")})
+        return
+
+    if args.cmd == "launch":
+        brief = read_brief(args.brief_file)
+        backend, config = backend_for(args)
+        if config.backend == "hax":
+            try:
+                backend.preflight(config)
+            except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
+                fail(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc), getattr(exc, "details", None))
+            if config.mode == "oneshot":
+                result = backend.run_oneshot(config, prompt=brief, cwd=args.cwd)
+                manifest = {"run_id": f"tmux-{int(time.time())}", "label": args.name, "workspace_id": "direct-oneshot", "pane_id": "direct-oneshot",
+                            "cwd": os.path.abspath(args.cwd), "worktree": os.path.abspath(args.cwd), "branch": "unknown", "state": result["state"],
+                            "blocker": result.get("code") if result["state"] != "verifying" else None, "backend_exit_code": result.get("exit_code"),
+                            **config.manifest_fields(runtime="tmux")}
+                path = safe_manifest_path(args, args.name)
+                save_manifest(path, manifest)
+                emit({**manifest, "manifest_path": str(path), "stdout": result["stdout"], "stderr": result["stderr"], "command": result["command"]})
+                return
+            command = ["exec", *backend.build_command(config)]
+        else:
+            command = ["exec", "pi", "-e", os.path.expanduser(args.extension), "--model", MODEL, "--name", args.name, brief]
+        cwd = os.path.abspath(args.cwd)
+        if args.split == "spawn":
+            result = run(["new-window", "-P", "-F", "#{pane_id}", "-n", PREFIX + args.name, "-c", cwd, shlex.join(command)])
+        else:
+            result = run(["split-window", "-P", "-F", "#{pane_id}", "-h" if args.split == "right" else "-v", "-c", cwd, shlex.join(command)])
+        if result.returncode:
+            fail(2, "LAUNCH_FAILED", result.stderr.strip() or "tmux launch failed", "check tmux state")
+        pane_id = result.stdout.strip()
+        run(["select-pane", "-t", pane_id, "-T", PREFIX + args.name])
+        readiness = wait_ready(pane_id, 20, 0.2) if config.backend == "hax" else None
+        submission = send_literal(pane_id, brief) if config.backend == "hax" else None
+        manifest = {"run_id": f"tmux-{int(time.time())}", "label": args.name, "workspace_id": "tmux", "tab_id": "tmux", "pane_id": pane_id,
+                    "cwd": cwd, "worktree": cwd, "branch": "unknown", "state": "working" if config.backend == "hax" else "ready",
+                    "blocker": None, **config.manifest_fields(runtime="tmux")}
+        if readiness:
+            manifest["hax_readiness"] = readiness
+            manifest["hax_submission"] = submission
+        path = safe_manifest_path(args, args.name)
+        save_manifest(path, manifest)
+        emit({**manifest, "manifest_path": str(path), "launched": True, "split": args.split, "title": PREFIX + args.name, "briefChars": len(brief)})
+        return
+
+    if args.cmd == "send":
+        saved = read_manifest(args.manifest) if args.manifest else {}
+        backend, config = backend_for(args, saved)
+        if config.backend == "hax":
+            try:
+                backend.preflight(config)
+            except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
+                fail(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc), getattr(exc, "details", None))
+            if config.mode != "interactive":
+                fail(3, "BACKEND_NOT_STEERABLE", "one-shot Hax workers cannot receive pane messages", "launch with --mode interactive")
+        live = panes()
+        target = next((row for row in live if row["paneId"] == args.pane_id), None)
+        if not target:
+            fail(2, "NOT_FOUND", "pane not found", "run list")
+        if not target["isPi"] and not args.force:
+            fail(3, "SAFETY_REFUSAL", "refusing non-worker pane", "use --force deliberately")
+        emit(send_literal(args.pane_id, args.text) | {"backend": config.backend})
+        return
+
+    if args.cmd == "status":
+        live = panes()
+        saved = read_manifest(args.manifest) if args.manifest else {}
+        if args.manifest_dir:
+            records = []
+            for path in sorted(Path(args.manifest_dir).glob("*.json")):
+                try:
+                    records.append(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    continue
+        else:
+            records = [saved] if saved else []
+        by_pane = {str(record.get("pane_id") or record.get("paneId")): record for record in records if record}
+        workers = []
+        for row in live:
+            if row["isPi"]:
+                record = by_pane.get(row["paneId"], {})
+                workers.append({"paneId": row["paneId"], "label": row["label"], "backend": record.get("backend", "pi"),
+                                "runtime": record.get("runtime", "tmux"), "state": record.get("state", "unknown")})
+        emit({"runtime": "tmux", "workers": workers})
+        return
+
+    if args.cmd == "cleanup":
+        try:
+            pattern = re.compile(args.pattern)
+        except re.error as exc:
+            fail(1, "INVALID_PATTERN", "cleanup pattern is not a valid regex", str(exc))
+        live = panes()
+        matches = [row for row in live if pattern.search(row["title"] or "")]
+        safe_matches = [row for row in matches if row["isPi"] or args.force]
+        payload = {"runtime": "tmux", "dryRun": not args.confirm or args.dry_run, "pattern": args.pattern,
+                   "matches": matches, "killed": []}
+        if payload["dryRun"]:
+            emit(payload)
+            return
+        for row in safe_matches:
+            result = run(["kill-pane", "-t", row["paneId"]])
+            if result.returncode:
+                fail(2, "CLEANUP_FAILED", result.stderr.strip() or "tmux kill-pane failed", "retry after checking tmux")
+            payload["killed"].append({"paneId": row["paneId"], "title": row["title"]})
+        emit(payload)
+        return
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

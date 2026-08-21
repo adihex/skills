@@ -18,6 +18,8 @@ def main():
     op = " ".join(args[:2])
     if log_path:
         safe = {"op": op}
+        if args[:2] == ["agent", "start"]:
+            safe["args"] = args[2:]
         if args[:2] == ["pane", "send-keys"]:
             safe.update({"pane": args[2], "key": args[3]})
         elif args[:2] == ["agent", "send"]:

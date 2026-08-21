@@ -23,8 +23,10 @@ jobs:
         run: |
           python -m unittest discover -s tests -v
           python -m unittest discover -s skills/herdr-pi-team/tests -v
-      - name: Run golden scenarios
+      - name: Run hardening golden scenarios
         run: python skills/pi-dogfood-os/scripts/run-golden --all --json
+      - name: Run Hax runtime golden scenarios
+        run: python skills/pi-dogfood-os/scripts/run-hax-golden --json
       - name: Compile Python
         run: python -m compileall -q skills scripts tests
       - name: Check diff whitespace

@@ -24,6 +24,14 @@ python3 skills/pi-dogfood-os/scripts/run-golden --all --json
 
 G1 detects session mismatch. G2 blocks launch after setup failure. G3 bounds setup and active-worker queues. G4 proves stable IDs survive label changes. G5 proves Enter submission and readback. G6 blocks dirty/unpushed completion. G7 classifies CodeRabbit rate limiting as `blocked_external`. G8 accepts a clean pushed reviewed worker. G9 stops only owned processes and removes a disposable worktree. G10 proves repeated cleanup is safe and protects the main checkout.
 
+Run the independent Hax runtime gate after Hax/backend changes:
+
+```bash
+python3 skills/pi-dogfood-os/scripts/run-hax-golden --json
+```
+
+H1–H13 cover Pi defaults, explicit Hax manifests, missing binary/auth/model blockers, readiness and Enter transport, one-shot output, HTTP 429, coexistence cleanup, shared completion, tmux send ordering, WezTerm fencing/safety, and Herdr's shell-backed Hax adapter. The harness uses only fake commands and temporary repositories; it never calls a live subscription.
+
 A scenario must import live code and emit reproducible evidence. Any FAIL blocks release. Use `--subset G1-G4,G8` only for a time-boxed diagnostic, never as the final gate.
 
 ## Bounded dispatch

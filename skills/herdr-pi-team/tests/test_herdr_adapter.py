@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[3]
 MODULE_PATH = ROOT / "skills" / "herdr-pi-team" / "scripts" / "herdr_adapter.py"
 FAKE = ROOT / "tests" / "fixtures" / "fake_herdr.py"
+FAKE_HAX = ROOT / "tests" / "fixtures" / "fake_hax.py"
 spec = importlib.util.spec_from_file_location("herdr_adapter", MODULE_PATH)
 adapter_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter_module)
@@ -113,6 +114,43 @@ class HerdrAdapterTests(unittest.TestCase):
         result = self.adapter("missing-pane").reconcile(self.manifest())
         self.assertIn("missing_pane", result["issues"])
         self.assertFalse(result["ok"])
+
+    def test_hax_interactive_uses_shell_backed_command_and_readiness(self):
+        adapter = self.adapter(backend_config={"backend": "hax", "provider": "codex", "model": "gpt-5.6-sol", "effort": "high", "auth_source": "hax_managed"},
+                               hax_command=str(FAKE_HAX), codex_command=str(FAKE_HAX))
+        result = adapter.launch(run_id="run-hax", label="hax-worker", cwd=str(self.root), worktree=str(self.root),
+                                branch="feature", brief_file=str(self.brief))
+        self.assertEqual(result["backend"], "hax")
+        self.assertEqual(result["runtime"], "herdr")
+        self.assertEqual(result["state"], "working")
+        entries = [json.loads(line) for line in self.log.read_text().splitlines()]
+        ops = [entry["op"] for entry in entries]
+        self.assertLess(ops.index("pane read"), ops.index("agent send"))
+        start = next(entry for entry in entries if entry["op"] == "agent start")
+        self.assertIn(str(FAKE_HAX), start["args"])
+        self.assertIn("--provider=codex", start["args"])
+        self.assertNotIn("--kind", str(entries))
+
+    def test_hax_missing_binary_fails_before_workspace_creation(self):
+        adapter = self.adapter(backend_config={"backend": "hax", "provider": "codex", "model": "gpt-5.6-sol", "auth_source": "hax_managed"},
+                               hax_command=str(self.root / "missing-hax"), codex_command=str(FAKE_HAX))
+        with self.assertRaises(adapter_module.AdapterError) as context:
+            adapter.launch(run_id="run-hax", label="hax-worker", cwd=str(self.root), worktree=str(self.root),
+                           branch="feature", brief_file=str(self.brief))
+        self.assertEqual(context.exception.code, "hax_missing")
+        if self.log.exists():
+            self.assertNotIn("workspace create", self.log.read_text())
+
+    def test_hax_oneshot_is_direct_and_non_steerable(self):
+        adapter = self.adapter(backend_config={"backend": "hax", "provider": "codex", "model": "gpt-5.6-sol", "mode": "oneshot", "auth_source": "hax_managed"},
+                               hax_command=str(FAKE_HAX), codex_command=str(FAKE_HAX))
+        result = adapter.launch(run_id="run-hax", label="hax-worker", cwd=str(self.root), worktree=str(self.root),
+                                branch="feature", brief_file=str(self.brief))
+        self.assertEqual(result["state"], "verifying")
+        self.assertFalse(result["backend_capabilities"]["steerable"])
+        if self.log.exists():
+            self.assertNotIn("workspace create", self.log.read_text())
+
 
 
 if __name__ == "__main__":
