@@ -1,0 +1,61 @@
+{
+  "baseline": "9efc14b1faea53e7111c9e9de1edc2d4f31ce5e4",
+  "fixtures": [
+    {
+      "id": "send-without-enter",
+      "kind": "synthetic-command-trace",
+      "input": ["agent send pane-1 literal text"],
+      "observed": "text is written but no submit key is sent",
+      "expected": "submission requires a separate Enter operation and readback"
+    },
+    {
+      "id": "name-lookup-agent-not-found",
+      "kind": "synthetic-identity-mismatch",
+      "input": {"label": "worker-a", "pane_id": "pane-renamed"},
+      "observed": "name lookup cannot target the stable pane identity",
+      "expected": "manifest pane_id is authoritative; name lookup must fail closed"
+    },
+    {
+      "id": "setup-queued-before-worker",
+      "kind": "synthetic-lifecycle-trace",
+      "input": ["setup: queued", "worker: launched"],
+      "observed": "worker launch is possible before setup readiness",
+      "expected": "worker launch is refused until setup reports ready"
+    },
+    {
+      "id": "idle-final-summary",
+      "kind": "synthetic-state-mismatch",
+      "input": {"native_state": "idle", "pane_tail": "RESULT: complete"},
+      "observed": "idle is not enough evidence for completion",
+      "expected": "completion requires manifest, git, push, review, checks, and cleanup evidence"
+    },
+    {
+      "id": "dirty-worktree-complete",
+      "kind": "synthetic-git-state",
+      "input": {"state": "complete", "dirty": true},
+      "observed": "documentation has no deterministic completion gate",
+      "expected": "dirty worktrees are blocked"
+    },
+    {
+      "id": "coderabbit-rate-limit",
+      "kind": "synthetic-review-response",
+      "input": {"message": "rate limit exceeded", "review": null},
+      "observed": "a rate-limit response can be mistaken for review success",
+      "expected": "blocked_external with bounded retry and no substantive-review claim"
+    },
+    {
+      "id": "stale-worker-processes",
+      "kind": "synthetic-process-inventory",
+      "input": {"worktree": "/disposable/worktree", "processes": ["nx", "git-fsmonitor", "worker-child"]},
+      "observed": "no cleanup implementation checks PID identity and cwd",
+      "expected": "only owned target processes may be stopped"
+    },
+    {
+      "id": "slow-worktree-removal",
+      "kind": "synthetic-cleanup-trace",
+      "input": ["remove worktree: timeout"],
+      "observed": "no transactional cleanup state preserves a retryable manifest",
+      "expected": "cleanup_pending is preserved and destructive retries are bounded"
+    }
+  ]
+}

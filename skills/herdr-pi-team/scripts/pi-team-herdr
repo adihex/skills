@@ -1,78 +1,212 @@
 #!/usr/bin/env python3
-"""Safe JSON-first herdr wrapper for visible pi team panes (stdlib only)."""
+"""JSON-first Herdr worker lifecycle CLI.
+
+All Herdr calls use one explicit session and all targeting uses manifest pane IDs.
+"""
+from __future__ import annotations
+
 import argparse
+import glob
+import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
-NAME='pi-team-herdr';VERSION='0.1.0';PREFIX='π - ';MODEL='opencode/deepseek-v4-flash-free';EXT='~/.pi/agent/extensions/team.ts';SESSION=None
-def emit(x): print(json.dumps(x,ensure_ascii=False))
-def fail(n,c,m,s): print(json.dumps({'error':True,'code':c,'message':m,'suggestion':s}),file=sys.stderr);raise SystemExit(n)
-class P(argparse.ArgumentParser):
- def error(self,m):fail(1,'USAGE',m,'run --help')
-def run(a):
- cmd=['herdr']+(['--session',SESSION] if SESSION else [])+a
- try:return subprocess.run(cmd,capture_output=True,text=True,timeout=20)
- except FileNotFoundError:fail(2,'MUX_UNAVAILABLE','herdr binary not found','install herdr and start a session')
- except subprocess.TimeoutExpired:fail(2,'MUX_TIMEOUT','herdr command timed out','check the herdr server')
-def data(a):
- q=run(a)
- if q.returncode:fail(2,'MUX_UNAVAILABLE',q.stderr.strip() or 'herdr API unavailable','start/attach herdr')
- try:return json.loads(q.stdout)['result']
- except Exception:fail(2,'INVALID_RESPONSE','herdr returned invalid JSON','upgrade herdr or check its server')
-def panes():
- ps=data(['pane','list']).get('panes',[]);out=[]
- for p in ps:
-  title=p.get('title') or p.get('label') or ''; out.append({'paneId':p.get('pane_id') or p.get('id'),'tabId':p.get('tab_id'),'workspaceId':p.get('workspace_id'),'title':title,'label':p.get('label') or (title[4:] if title.startswith(PREFIX) else p.get('agent')),'agentState':p.get('agent_status') or p.get('agent_state') or p.get('state'),'isPi':bool(p.get('agent') or title.startswith(PREFIX))})
- return out
-def brief():return {'name':NAME,'version':VERSION,'backend':'herdr','purpose':'Manage named pi agents in one explicit Herdr session/workspace/tab/pane hierarchy.','commands':['list','launch','send','status','cleanup'],'sessionFlag':'--session NAME (use consistently with the visible herdr client)'}
-def read_brief(path):
- try:
-  with open(path,'r',encoding='utf-8') as f:return f.read()
- except OSError as e:fail(2,'BRIEF_NOT_READABLE','brief file is not readable',str(e) or 'create the brief first')
-def main(v):
- p=P(prog=NAME);p.add_argument('--brief',action='store_true');p.add_argument('--version',action='store_true');p.add_argument('--session',help='Herdr session name; use the same value for the visible Herdr client and all worker commands');s=p.add_subparsers(dest='cmd')
- x=s.add_parser('list');x.add_argument('--human',action='store_true')
- x=s.add_parser('launch');x.add_argument('--name',required=True);x.add_argument('--brief-file',required=True);x.add_argument('--cwd',default=os.getcwd());x.add_argument('--workspace',help='target Herdr workspace ID; avoids relying on whichever workspace is focused');x.add_argument('--model',default=MODEL);x.add_argument('--thinking',choices=['off','minimal','low','medium','high','xhigh','max'],help='Pi reasoning effort for this worker');x.add_argument('--extension',default=EXT)
- x=s.add_parser('send');x.add_argument('--pane-id',required=True);x.add_argument('--text',required=True);x.add_argument('--require-idle',action='store_true');x.add_argument('--submit',action='store_true',help='submit sent text with Herdr key name enter');x.add_argument('--force',action='store_true')
- x=s.add_parser('status');x.add_argument('--human',action='store_true')
- x=s.add_parser('cleanup');x.add_argument('--pattern',required=True);x.add_argument('--dry-run',action='store_true');x.add_argument('--confirm',action='store_true');x.add_argument('--force',action='store_true')
- a=p.parse_args(v)
- global SESSION
- SESSION=a.session
- if a.version:emit({'name':NAME,'version':VERSION});return
- if a.brief or not a.cmd:emit(brief());return
- ps=panes()
- if a.cmd=='list': emit({'panes':ps,'count':len(ps)}) if not a.human else print('\n'.join('%s  %s' %(z['paneId'],z['title']) for z in ps));return
- if a.cmd=='status': emit({'workers':[{'paneId':z['paneId'],'label':z['label'],'state':z['agentState']} for z in ps if z['isPi']]});return
- if a.cmd=='launch':
-  if not os.path.isfile(a.brief_file):fail(2,'BRIEF_NOT_READABLE','brief file is not readable','create the brief first')
-  brief_text=read_brief(a.brief_file)
-  launch=['agent','start',a.name,'--cwd',os.path.abspath(a.cwd)]+(['--workspace',a.workspace] if a.workspace else [])+['--','pi','-e',os.path.expanduser(a.extension),'--model',a.model]+(['--thinking',a.thinking] if a.thinking else [])+['--name',a.name,brief_text]
-  q=run(launch)
-  if q.returncode:fail(2,'LAUNCH_FAILED',q.stderr.strip() or 'herdr agent start failed','check the herdr session')
-  emit({'launched':True,'title':PREFIX+a.name,'cwd':os.path.abspath(a.cwd),'workspaceId':a.workspace,'thinking':a.thinking,'briefChars':len(brief_text)});return
- if a.cmd=='send':
-  z=next((z for z in ps if str(z['paneId'])==str(a.pane_id)),None)
-  if not z:fail(2,'NOT_FOUND','pane not found','run list')
-  if not z['isPi'] and not a.force:fail(3,'SAFETY_REFUSAL','refusing non-pi pane','use --force deliberately')
-  if a.require_idle and z['agentState']!='idle' and not a.force:fail(3,'SAFETY_REFUSAL','agent is not idle','wait or use --force deliberately')
-  q=run(['agent','send',str(a.pane_id),a.text])
-  if q.returncode:fail(2,'SEND_FAILED',q.stderr.strip() or 'herdr agent send failed','check the target')
-  if a.submit:
-   q=run(['pane','send-keys',str(a.pane_id),'enter'])
-   if q.returncode:fail(2,'SUBMIT_FAILED',q.stderr.strip() or 'herdr pane send-keys enter failed','the message was sent but was not submitted')
-  emit({'paneId':a.pane_id,'sent':True,'submitted':bool(a.submit),'chars':len(a.text),'fenced':True});return
- try:rx=re.compile(a.pattern)
- except re.error as e:fail(1,'INVALID_PATTERN','cleanup pattern is not a valid regex',str(e))
- matches=[z for z in ps if rx.search(z['title'])]
- if a.dry_run or not a.confirm:emit({'dryRun':True,'pattern':a.pattern,'matches':matches,'killed':[]});return
- killed=[]
- for z in matches:
-  if not z['isPi'] and not a.force:continue
-  q=run(['pane','close',str(z['paneId'])])
-  if q.returncode:fail(2,'CLEANUP_FAILED',q.stderr.strip() or 'herdr pane close failed','retry after checking herdr')
-  killed.append({'paneId':z['paneId'],'title':z['title']})
- emit({'dryRun':False,'pattern':a.pattern,'matches':matches,'killed':killed})
-if __name__=='__main__':main(sys.argv[1:])
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+def load(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+adapter_module = load("herdr_adapter", "herdr_adapter.py")
+store_module = load("manifest_store", "manifest_store.py")
+cleanup_module = load("cleanup", "cleanup.py")
+
+NAME = "pi-team-herdr"
+VERSION = "0.2.0"
+
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def fail(code: int, error_code: str, message: str, suggestion: str | None = None):
+    value = {"error": True, "code": error_code, "message": message}
+    if suggestion:
+        value["suggestion"] = suggestion
+    print(json.dumps(value, ensure_ascii=False), file=sys.stderr)
+    raise SystemExit(code)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        fail(1, "USAGE", message, "run pi-team-herdr --help")
+
+
+def branch_for(cwd: str) -> str:
+    result = subprocess.run(["git", "-C", cwd, "branch", "--show-current"], capture_output=True, text=True, timeout=20, shell=False)
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
+
+
+def adapter(args):
+    return adapter_module.HerdrAdapter(session=args.session, herdr_command=args.herdr_command,
+                                       pi_command=args.pi_command, extension=args.extension,
+                                       timeout=args.timeout, poll_interval=args.poll_interval)
+
+
+def read_manifest(path: str):
+    value = store_module.ManifestStore(path).read()
+    if not value:
+        fail(2, "MANIFEST_UNREADABLE", "manifest is missing or invalid", "create the manifest with launch")
+    return value
+
+
+def write_manifest(path: str | None, value: dict):
+    if path:
+        store_module.ManifestStore(path).write(value)
+
+
+def main(argv=None):
+    parser = Parser(prog=NAME)
+    parser.add_argument("--session", help="one session name used for every Herdr command")
+    parser.add_argument("--herdr-command", default="herdr", help=argparse.SUPPRESS)
+    parser.add_argument("--pi-command", default="pi", help=argparse.SUPPRESS)
+    parser.add_argument("--extension", default="~/.pi/agent/extensions/team.ts", help=argparse.SUPPRESS)
+    parser.add_argument("--timeout", type=float, default=20.0, help=argparse.SUPPRESS)
+    parser.add_argument("--poll-interval", type=float, default=0.2, help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--brief", action="store_true")
+    sub = parser.add_subparsers(dest="command")
+
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("--human", action="store_true")
+
+    launch = sub.add_parser("launch")
+    launch.add_argument("--name", required=True)
+    launch.add_argument("--brief-file", required=True)
+    launch.add_argument("--run-id", default=None)
+    launch.add_argument("--cwd", default=os.getcwd())
+    launch.add_argument("--worktree", default=None)
+    launch.add_argument("--branch", default=None)
+    launch.add_argument("--workspace", default=None)
+    launch.add_argument("--manifest", default=None)
+    launch.add_argument("--model", default="opencode/deepseek-v4-flash-free")
+    launch.add_argument("--thinking", choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+    launch.add_argument("--setup-timeout", type=float, default=30.0)
+
+    send = sub.add_parser("send")
+    send.add_argument("--manifest", required=True)
+    send.add_argument("--text", required=True)
+    send.add_argument("--acknowledge", default=None, help=argparse.SUPPRESS)
+
+    status = sub.add_parser("status")
+    status.add_argument("--manifest", required=True)
+
+    reconcile = sub.add_parser("reconcile")
+    reconcile.add_argument("--manifest", required=True)
+    reconcile.add_argument("--report", default=None)
+    reconcile.add_argument("--heartbeat-timeout", type=float, default=300.0)
+
+    cleanup = sub.add_parser("cleanup")
+    cleanup.add_argument("--manifest", required=True)
+    cleanup.add_argument("--worktree-root", required=True)
+    cleanup.add_argument("--main-checkout", required=True)
+    cleanup.add_argument("--current-cwd", default=os.getcwd())
+    cleanup.add_argument("--confirm", action="store_true")
+    cleanup.add_argument("--require-pushed", dest="require_pushed", action="store_true", default=True)
+    cleanup.add_argument("--allow-unpushed", dest="require_pushed", action="store_false")
+
+    watch = sub.add_parser("watch")
+    watch.add_argument("--manifest-dir", required=True)
+    watch.add_argument("--run-id", required=True)
+    watch.add_argument("--worktree-root", required=True)
+    watch.add_argument("--main-checkout", required=True)
+    watch.add_argument("--current-cwd", default=os.getcwd())
+    watch.add_argument("--cleanup", action="store_true")
+    watch.add_argument("--require-pushed", action="store_true")
+    watch.add_argument("--poll", type=float, default=15.0)
+    watch.add_argument("--once", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.version:
+        emit({"name": NAME, "version": VERSION})
+        return
+    if args.brief or not args.command:
+        emit({"name": NAME, "version": VERSION, "backend": "herdr", "commands": ["list", "launch", "send", "status", "reconcile", "cleanup", "watch"], "session": "--session NAME is mandatory for named-session operations"})
+        return
+    try:
+        mux = adapter(args)
+        if args.command == "cleanup":
+            manifest = read_manifest(args.manifest)
+            manifest.setdefault("session", args.session)
+            manifest.setdefault("herdr_command", args.herdr_command)
+            store = store_module.ManifestStore(args.manifest)
+            manager = cleanup_module.CleanupManager(
+                worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
+                manifest_writer=store.write,
+            )
+            emit(manager.cleanup(manifest, confirm=args.confirm, require_pushed=args.require_pushed))
+            return
+        if args.command == "watch":
+            paths = sorted(glob.glob(os.path.join(args.manifest_dir, "*.json")))
+            def factory(manifest):
+                path = manifest.get("_manifest_path")
+                store = store_module.ManifestStore(path) if path else None
+                def save(value):
+                    if store:
+                        store.write({key: val for key, val in value.items() if key != "_manifest_path"})
+                return cleanup_module.CleanupManager(
+                    worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
+                    manifest_writer=save)
+            while True:
+                for path in paths:
+                    value = cleanup_module.load_manifest(path)
+                    if value is not None:
+                        value["_manifest_path"] = path
+                result = cleanup_module.watch_once(paths, run_id=args.run_id, manager_factory=factory,
+                                                   cleanup_enabled=args.cleanup, require_pushed=args.require_pushed)
+                emit(result)
+                if args.once or result["tracked"] == 0 or result["remaining"] == 0:
+                    return
+                time.sleep(args.poll)
+        if args.command == "list":
+            result = mux.preflight()
+            panes = result.get("panes", [])
+            if args.human:
+                print("\n".join(f"{p.get('pane_id') or p.get('id')}  {p.get('agent') or p.get('title', '')}  {p.get('agent_state') or p.get('state', '')}" for p in panes))
+            else:
+                emit({"session": mux._resolved_session, "panes": panes, "count": len(panes)})
+            return
+        if args.command == "launch":
+            cwd = os.path.abspath(args.cwd)
+            worktree = os.path.abspath(args.worktree or cwd)
+            run_id = args.run_id or f"run-{int(time.time())}"
+            value = mux.launch(run_id=run_id, label=args.name, cwd=cwd, worktree=worktree,
+                               branch=args.branch or branch_for(cwd), brief_file=args.brief_file,
+                               workspace_id=args.workspace, model=args.model, thinking=args.thinking,
+                               setup_timeout=args.setup_timeout)
+            value["session"] = args.session
+            value["herdr_command"] = args.herdr_command
+            write_manifest(args.manifest, value)
+            emit(value)
+            return
+        manifest = read_manifest(args.manifest)
+        if args.command == "send":
+            emit(mux.send(manifest, args.text, acknowledge=args.acknowledge))
+        elif args.command == "status":
+            emit(mux.status(manifest))
+        elif args.command == "reconcile":
+            emit(mux.reconcile(manifest, heartbeat_timeout=args.heartbeat_timeout, report_path=args.report))
+    except cleanup_module.CleanupError as exc:
+        fail(3 if exc.code == "CLEANUP_REFUSED" else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
+    except adapter_module.AdapterError as exc:
+        fail(2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
+
+
+if __name__ == "__main__":
+    main()

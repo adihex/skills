@@ -1,6 +1,6 @@
 # pi-dogfood-os — Operating Model
 
-> Distilled from the 2026-08-01 seed session (evidence: 22+ dispatches, 48 workers, 14 frictions). Full seed: `/tmp/team-task/dogfood/operating-model.md`.
+> Distilled from the 2026-08-01 seed session (evidence: 22+ dispatches, 48 workers, 14 frictions). Full seed: `$DOGFOOD_ARCHIVE/operating-model.md`.
 
 ## The loop
 
