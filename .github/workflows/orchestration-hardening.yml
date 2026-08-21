@@ -1,0 +1,31 @@
+name: orchestration-hardening
+
+on:
+  push:
+    branches: [main, 'agent/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  offline-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate skills
+        run: python scripts/validate_skills.py
+      - name: Run offline tests
+        run: |
+          python -m unittest discover -s tests -v
+          python -m unittest discover -s skills/herdr-pi-team/tests -v
+      - name: Run golden scenarios
+        run: python skills/pi-dogfood-os/scripts/run-golden --all --json
+      - name: Compile Python
+        run: python -m compileall -q skills scripts tests
+      - name: Check diff whitespace
+        run: git diff --check
