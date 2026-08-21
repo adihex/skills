@@ -38,7 +38,9 @@ pi-team-herdr --session NAME list [--human]
 pi-team-herdr --session NAME launch --name LABEL --brief-file FILE [--manifest FILE]
 pi-team-herdr --session NAME send --manifest FILE --text TEXT
 pi-team-herdr --session NAME status --manifest FILE
-pi-team-herdr --session NAME reconcile --manifest FILE [--report FILE]
+pi-team-herdr --session NAME reconcile --run RUN_ID --manifest-dir DIR [--report FILE]
+pi-team-herdr --session NAME complete --manifest FILE --report FILE --repository OWNER/REPO [--pr NUMBER]
+
 pi-team-herdr cleanup --manifest FILE --worktree-root ROOT --main-checkout CHECKOUT [--confirm]
 pi-team-herdr watch --manifest-dir DIR --run-id ID --worktree-root ROOT --main-checkout CHECKOUT --cleanup --require-pushed --poll 15
 ```

@@ -26,6 +26,8 @@ def load(name: str, filename: str):
 adapter_module = load("herdr_adapter", "herdr_adapter.py")
 store_module = load("manifest_store", "manifest_store.py")
 cleanup_module = load("cleanup", "cleanup.py")
+git_gate_module = load("git_gate", "git_gate.py")
+state_module = load("run_state", "run_state.py")
 
 NAME = "pi-team-herdr"
 VERSION = "0.2.0"
@@ -60,7 +62,7 @@ def adapter(args):
 
 
 def read_manifest(path: str):
-    value = store_module.ManifestStore(path).read()
+    value = store_module.ManifestStore.from_path(path).read()
     if not value:
         fail(2, "MANIFEST_UNREADABLE", "manifest is missing or invalid", "create the manifest with launch")
     return value
@@ -68,13 +70,51 @@ def read_manifest(path: str):
 
 def write_manifest(path: str | None, value: dict):
     if path:
-        store_module.ManifestStore(path).write(value)
+        store_module.ManifestStore.from_path(path).write(value)
+
+
+def resolve_manifest_path(args) -> str:
+    if getattr(args, "manifest", None):
+        return args.manifest
+    run_id = getattr(args, "run_id", None)
+    directory = getattr(args, "manifest_dir", None)
+    if not run_id or not directory:
+        fail(1, "USAGE", "reconcile needs --manifest or --run RUN_ID with --manifest-dir DIR")
+    matches = []
+    for path in sorted(glob.glob(os.path.join(directory, "*.json"))):
+        value = cleanup_module.load_manifest(path)
+        if value and value.get("run_id") == run_id:
+            matches.append(path)
+    if len(matches) != 1:
+        fail(2, "MANIFEST_NOT_UNIQUE", "run ID must resolve to exactly one manifest", f"found {len(matches)} matches")
+    return matches[0]
+
+
+def completion_evidence(args, manifest, report_path):
+    git = git_gate_module.GitGate(git_command=args.git_command, gh_command=args.gh_command)
+    git_evidence = git.verify_worktree(worktree=manifest["worktree"], expected_worktree=manifest["worktree"],
+                                       expected_branch=manifest["branch"], require_upstream=True)
+    report = git_gate_module.parse_worker_report(report_path, expected_worktree=manifest["worktree"], expected_branch=manifest["branch"])
+    pr = git.discover_pr(branch=manifest["branch"], explicit_pr=args.pr)
+    pr_number = int(pr.get("number") or 0)
+    if report["PR"] != str(pr_number):
+        raise git_gate_module.GateError("REPORT_PR_MISMATCH", "report PR does not match discovered PR")
+    reviews = git.retrieve_reviews(repository=args.repository, pr_number=pr_number)
+    checks = git.poll_checks(repository=args.repository, commit_sha=git_evidence["head_sha"], pr_number=pr_number)
+    result = git_gate_module.completion_gate(git=git_evidence, review_status=reviews["review_status"], checks_status=checks["status"])
+    if not result["ok"]:
+        raise git_gate_module.GateError("COMPLETION_BLOCKED", result["reason"], details={"state": result["state"], "review": reviews["review_status"], "checks": checks["status"]})
+    evidence = {"head_sha": git_evidence["head_sha"], "pushed_sha": git_evidence["pushed_sha"], "pr_number": pr_number,
+                "review_status": "approved", "checks_status": checks["status"], "worktree_clean": True, "synchronized": True}
+    return evidence, {"git": git_evidence, "report": report, "pr": pr, "reviews": reviews, "checks": checks, "completion": result}
 
 
 def main(argv=None):
     parser = Parser(prog=NAME)
     parser.add_argument("--session", help="one session name used for every Herdr command")
     parser.add_argument("--herdr-command", default="herdr", help=argparse.SUPPRESS)
+    parser.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
+    parser.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
     parser.add_argument("--pi-command", default="pi", help=argparse.SUPPRESS)
     parser.add_argument("--extension", default="~/.pi/agent/extensions/team.ts", help=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=20.0, help=argparse.SUPPRESS)
@@ -108,9 +148,20 @@ def main(argv=None):
     status.add_argument("--manifest", required=True)
 
     reconcile = sub.add_parser("reconcile")
-    reconcile.add_argument("--manifest", required=True)
+    reconcile.add_argument("--manifest", default=None)
+    reconcile.add_argument("--run", dest="run_id", default=None)
+    reconcile.add_argument("--manifest-dir", default=None)
     reconcile.add_argument("--report", default=None)
     reconcile.add_argument("--heartbeat-timeout", type=float, default=300.0)
+    reconcile.add_argument("--repository", default=None)
+    reconcile.add_argument("--pr", type=int, default=None)
+
+    complete = sub.add_parser("complete")
+    complete.add_argument("--manifest", required=True)
+    complete.add_argument("--report", required=True)
+    complete.add_argument("--repository", required=True)
+    complete.add_argument("--pr", type=int, default=None)
+    complete.add_argument("--checks-commit", default=None)
 
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--manifest", required=True)
@@ -141,11 +192,18 @@ def main(argv=None):
         return
     try:
         mux = adapter(args)
+        if args.command == "complete":
+            manifest = read_manifest(args.manifest)
+            evidence, details = completion_evidence(args, manifest, args.report)
+            updated = state_module.transition(manifest, "complete", evidence)
+            store_module.ManifestStore.from_path(args.manifest).write(updated)
+            emit({"manifest": updated, "evidence": details, "state": "complete"})
+            return
         if args.command == "cleanup":
             manifest = read_manifest(args.manifest)
             manifest.setdefault("session", args.session)
             manifest.setdefault("herdr_command", args.herdr_command)
-            store = store_module.ManifestStore(args.manifest)
+            store = store_module.ManifestStore.from_path(args.manifest)
             manager = cleanup_module.CleanupManager(
                 worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
                 manifest_writer=store.write,
@@ -156,7 +214,7 @@ def main(argv=None):
             paths = sorted(glob.glob(os.path.join(args.manifest_dir, "*.json")))
             def factory(manifest):
                 path = manifest.get("_manifest_path")
-                store = store_module.ManifestStore(path) if path else None
+                store = store_module.ManifestStore.from_path(path) if path else None
                 def save(value):
                     if store:
                         store.write({key: val for key, val in value.items() if key != "_manifest_path"})
@@ -195,13 +253,54 @@ def main(argv=None):
             write_manifest(args.manifest, value)
             emit(value)
             return
+        if args.command == "reconcile":
+            manifest_path = resolve_manifest_path(args)
+            manifest = read_manifest(manifest_path)
+            result = mux.reconcile(manifest, heartbeat_timeout=args.heartbeat_timeout, report_path=args.report)
+            issues = list(result.get("issues", []))
+            report_path = args.report or manifest.get("report_path")
+            report = None
+            try:
+                if not report_path:
+                    raise git_gate_module.GateError("REPORT_MISSING", "reconcile requires a final worker report")
+                report = git_gate_module.parse_worker_report(report_path, expected_worktree=manifest.get("worktree"), expected_branch=manifest.get("branch"))
+            except git_gate_module.GateError as exc:
+                issues.append(exc.code)
+                report = {"error": exc.code}
+            git_evidence = {}
+            try:
+                git_evidence = git_gate_module.GitGate(git_command=args.git_command, gh_command=args.gh_command).verify_worktree(
+                    worktree=manifest["worktree"], expected_worktree=manifest["worktree"], expected_branch=manifest["branch"], require_upstream=True)
+            except (KeyError, git_gate_module.GateError) as exc:
+                code = getattr(exc, "code", "GIT_EVIDENCE_MISSING")
+                issues.append(code)
+                git_evidence = {"error": code}
+            evidence = {"head_sha": git_evidence.get("head_sha"), "pushed_sha": git_evidence.get("pushed_sha"),
+                        "pr_number": manifest.get("pr_number"), "review_status": manifest.get("review_status"),
+                        "checks_status": manifest.get("checks_status"), "worktree_clean": git_evidence.get("clean") is True,
+                        "synchronized": git_evidence.get("synchronized") is True}
+            completion = git_gate_module.completion_gate(git=git_evidence, review_status=evidence["review_status"], checks_status=evidence["checks_status"])
+            state_machine = {"ok": False, "error": "not_checked"}
+            try:
+                probe = dict(manifest)
+                probe["state"] = "review_pending"
+                state_machine = {"ok": True, "state": state_module.transition(probe, "complete", evidence)["state"]}
+            except ValueError as exc:
+                state_machine = {"ok": False, "error": getattr(exc, "code", "STATE_MACHINE_REJECTED")}
+                issues.append(state_machine["error"])
+            result.update({"manifest_path": manifest_path, "report": report, "git_gate": git_evidence,
+                           "completion_gate": completion, "state_machine": state_machine})
+            if not completion["ok"]:
+                issues.append(completion["state"])
+            result["issues"] = sorted(set(issues))
+            result["ok"] = not result["issues"]
+            emit(result)
+            return
         manifest = read_manifest(args.manifest)
         if args.command == "send":
             emit(mux.send(manifest, args.text, acknowledge=args.acknowledge))
         elif args.command == "status":
             emit(mux.status(manifest))
-        elif args.command == "reconcile":
-            emit(mux.reconcile(manifest, heartbeat_timeout=args.heartbeat_timeout, report_path=args.report))
     except cleanup_module.CleanupError as exc:
         fail(3 if exc.code == "CLEANUP_REFUSED" else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
     except adapter_module.AdapterError as exc:

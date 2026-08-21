@@ -14,6 +14,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "tests" / "fixtures"
 HERDR = ROOT / "skills" / "herdr-pi-team" / "scripts"
+CLI = HERDR / "pi-team-herdr"
+
+def run_cli(arguments: list[str], *, env: dict | None = None) -> subprocess.CompletedProcess[str]:
+    child_env = os.environ.copy()
+    if env:
+        child_env.update(env)
+    return subprocess.run([sys.executable, str(CLI)] + arguments, capture_output=True, text=True, env=child_env, shell=False)
+
 
 
 def load(name: str, path: Path):
@@ -71,59 +79,70 @@ def disposable_worktree(root: Path):
 def scenario_g1():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        mux, _, _ = fake_adapter(root, "session-mismatch")
-        try:
-            mux.preflight()
-        except adapter.AdapterError as exc:
-            return exc.code == "SESSION_MISMATCH", {"error_code": exc.code}
-    return False, {"error_code": "not_detected"}
+        _, _, log = fake_adapter(root, "session-mismatch")
+        result = run_cli(["--session", "review", "--herdr-command", str(FIXTURES / "fake_herdr.py"), "--pi-command", sys.executable,
+                          "--extension", str(root / "team.ts"), "list"], env={"FAKE_HERDR_SCENARIO": "session-mismatch", "FAKE_HERDR_LOG": str(log)})
+        payload = json.loads(result.stderr)
+        return result.returncode == 2 and payload["code"] == "SESSION_MISMATCH", {"error_code": payload.get("code")}
 
 
 def scenario_g2():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        mux, brief, log = fake_adapter(root, "setup-failure")
-        try:
-            mux.launch(run_id="run-g2", label="worker", cwd=str(root), worktree=str(root), branch="feature", brief_file=str(brief))
-        except adapter.AdapterError as exc:
-            commands = [json.loads(line)["op"] for line in log.read_text().splitlines()]
-            return exc.code == "SETUP_FAILED" and "agent start" not in commands, {"error_code": exc.code, "worker_started": "agent start" in commands}
-    return False, {"error_code": "not_detected"}
+        _, brief, log = fake_adapter(root, "setup-failure")
+        result = run_cli(["--session", "review", "--herdr-command", str(FIXTURES / "fake_herdr.py"), "--pi-command", sys.executable,
+                          "--extension", str(root / "team.ts"), "launch", "--name", "worker", "--run-id", "run-g2",
+                          "--brief-file", str(brief), "--cwd", str(root), "--worktree", str(root), "--branch", "feature",
+                          "--manifest", str(root / "manifest.json")], env={"FAKE_HERDR_SCENARIO": "setup-failure", "FAKE_HERDR_LOG": str(log)})
+        commands = [json.loads(line)["op"] for line in log.read_text().splitlines()]
+        payload = json.loads(result.stderr)
+        return result.returncode == 2 and payload["code"] == "SETUP_FAILED" and "agent start" not in commands, {"error_code": payload.get("code"), "worker_started": "agent start" in commands}
 
 
 def scenario_g3():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        mux, brief, _ = fake_adapter(root, "setup-timeout")
+        _, brief, log = fake_adapter(root, "setup-timeout")
         started = time.monotonic()
+        result = run_cli(["--session", "review", "--herdr-command", str(FIXTURES / "fake_herdr.py"), "--pi-command", sys.executable,
+                          "--extension", str(root / "team.ts"), "--poll-interval", "0.001", "launch", "--name", "worker", "--run-id", "run-g3",
+                          "--brief-file", str(brief), "--cwd", str(root), "--worktree", str(root), "--branch", "feature",
+                          "--setup-timeout", "0.01", "--manifest", str(root / "manifest.json")], env={"FAKE_HERDR_SCENARIO": "setup-timeout", "FAKE_HERDR_LOG": str(log)})
+        bounded = result.returncode == 2 and time.monotonic() - started < 1
+        payload = json.loads(result.stderr)
         try:
-            mux.launch(run_id="run-g3", label="worker", cwd=str(root), worktree=str(root), branch="feature", brief_file=str(brief), setup_timeout=0.01)
-        except adapter.AdapterError as exc:
-            bounded = exc.code == "SETUP_TIMEOUT" and time.monotonic() - started < 1
-            try:
-                policy.DispatchPolicy().admit(active_workers=4, setup_workers=0)
-            except policy.DispatchRefused as admission:
-                return bounded and admission.code == "MAX_ACTIVE", {"setup_error": exc.code, "admission": admission.code}
+            policy.DispatchPolicy().admit(active_workers=4, setup_workers=0)
+        except policy.DispatchRefused as admission:
+            return bounded and payload["code"] == "SETUP_TIMEOUT" and admission.code == "MAX_ACTIVE", {"setup_error": payload.get("code"), "admission": admission.code}
     return False, {"error_code": "not_detected"}
 
 
 def scenario_g4():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        mux, _, _ = fake_adapter(root)
-        manifest = {"pane_id": "pane-1", "label": "renamed-worker", "state": "ready", "worktree": str(root)}
-        result = mux.send(manifest, "stable target", acknowledge="ACKNOWLEDGED")
-        return result["acknowledged"] and result["pane_id"] == "pane-1", {"pane_id": result["pane_id"]}
+        _, _, log = fake_adapter(root)
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({"pane_id": "pane-1", "label": "renamed-worker", "state": "ready", "worktree": str(root)}), encoding="utf-8")
+        result = run_cli(["--session", "review", "--herdr-command", str(FIXTURES / "fake_herdr.py"), "--pi-command", sys.executable,
+                          "--extension", str(root / "team.ts"), "send", "--manifest", str(manifest), "--text", "stable target"],
+                         env={"FAKE_HERDR_SCENARIO": "ok", "FAKE_HERDR_LOG": str(log)})
+        payload = json.loads(result.stdout)
+        return result.returncode == 0 and payload["pane_id"] == "pane-1", {"pane_id": payload.get("pane_id")}
 
 
 def scenario_g5():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        mux, _, log = fake_adapter(root)
-        mux.send({"pane_id": "pane-1", "label": "worker", "state": "ready", "worktree": str(root)}, "message", acknowledge="ACKNOWLEDGED")
+        _, _, log = fake_adapter(root)
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({"pane_id": "pane-1", "label": "worker", "state": "ready", "worktree": str(root)}), encoding="utf-8")
+        result = run_cli(["--session", "review", "--herdr-command", str(FIXTURES / "fake_herdr.py"), "--pi-command", sys.executable,
+                          "--extension", str(root / "team.ts"), "send", "--manifest", str(manifest), "--text", "message"],
+                         env={"FAKE_HERDR_SCENARIO": "ok", "FAKE_HERDR_LOG": str(log)})
         commands = [json.loads(line) for line in log.read_text().splitlines()]
         enter = next((row for row in commands if row["op"] == "pane send-keys"), None)
-        return bool(enter and enter["key"] == "enter"), {"submit_key": enter["key"] if enter else None}
+        return result.returncode == 0 and bool(enter and enter["key"] == "enter"), {"submit_key": enter["key"] if enter else None}
+
 
 
 def scenario_g6():
@@ -138,37 +157,58 @@ def scenario_g7():
 
 
 def scenario_g8():
-    result = gate.completion_gate(git={"clean": True, "synchronized": True, "head_sha": "abc", "pushed_sha": "abc"}, review_status="approved", checks_status="passed")
-    return result["state"] == "complete", {"state": result["state"]}
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        worktree = root / "worktree"
+        worktree.mkdir()
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({"run_id": "g8", "state": "review_pending", "worktree": str(worktree), "branch": "feature/test"}), encoding="utf-8")
+        report = root / "report.txt"
+        report.write_text("\n".join(["RESULT: complete", f"WORKTREE: {worktree}", "BRANCH: feature/test", "COMMIT: abc123",
+                                      "PUSHED: abc123", "PR: 7", "CODERABBIT: approved", "CHECKS: passed", "CLEANUP: verified",
+                                      "BLOCKER: none", "EVIDENCE: golden-cli"]) + "\n", encoding="utf-8")
+        result = run_cli(["--git-command", str(FIXTURES / "fake_git.py"), "--gh-command", str(FIXTURES / "fake_gh.py"),
+                          "complete", "--manifest", str(manifest), "--report", str(report), "--repository", "org/repo", "--pr", "7"],
+                         env={"FAKE_GIT_SCENARIO": "ok", "FAKE_GH_SCENARIO": "ok"})
+        payload = json.loads(result.stdout) if result.stdout else {}
+        return result.returncode == 0 and payload.get("state") == "complete", {"state": payload.get("state"), "returncode": result.returncode}
 
 
-def cleanup_manager(main: Path, root: Path, stopped: list):
-    return cleanup.CleanupManager(worktree_root=str(root / "workers"), main_checkout=str(main), current_cwd=str(root / "operator"),
-                                  process_inspector=lambda: [{"pid": 1, "kind": "nx", "cwd": str(root / "workers" / "worker-1"), "owned": True}, {"pid": 2, "kind": "watchman", "cwd": str(root / "workers" / "worker-1"), "owned": True}],
-                                  process_stopper=lambda process: stopped.append(process["pid"]), workspace_closer=lambda _: None)
+
+def cli_cleanup(root: Path, main: Path, worktree: Path, run_id: str, *, confirm: bool = True):
+    manifest_path = root / f"{run_id}.json"
+    if not manifest_path.exists():
+        manifest_path.write_text(json.dumps({"run_id": run_id, "owner_run_id": run_id, "workspace_id": "ws", "worktree": str(worktree),
+                                            "repo_root": str(main), "state": "complete", "herdr_command": str(FIXTURES / "fake_herdr.py")}), encoding="utf-8")
+    args = ["--herdr-command", str(FIXTURES / "fake_herdr.py"), "cleanup", "--manifest", str(manifest_path),
+            "--worktree-root", str(root / "workers"), "--main-checkout", str(main)]
+    if confirm:
+        args.append("--confirm")
+    result = run_cli(args, env={"FAKE_HERDR_SCENARIO": "ok", "FAKE_HERDR_LOG": str(root / "herdr.jsonl")})
+    payload = json.loads(result.stdout) if result.stdout else json.loads(result.stderr)
+    return result, payload, manifest_path
 
 
 def scenario_g9():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         main, worktree = disposable_worktree(root)
-        stopped = []
-        manager = cleanup_manager(main, root, stopped)
-        manifest = {"run_id": "g9", "owner_run_id": "g9", "workspace_id": "ws", "worktree": str(worktree), "repo_root": str(main), "state": "complete"}
-        result = manager.cleanup(manifest, confirm=True)
-        return result["action"] == "cleaned" and stopped == [1] and not worktree.exists(), {"action": result["action"], "stopped": stopped}
+        result, payload, _ = cli_cleanup(root, main, worktree, "g9")
+        return result.returncode == 0 and payload.get("action") == "cleaned" and not worktree.exists(), {"action": payload.get("action"), "returncode": result.returncode, "error": payload.get("error")}
 
 
 def scenario_g10():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         main, worktree = disposable_worktree(root)
-        manager = cleanup_manager(main, root, [])
-        manifest = {"run_id": "g10", "owner_run_id": "g10", "workspace_id": "ws", "worktree": str(worktree), "repo_root": str(main), "state": "complete"}
-        first = manager.cleanup(manifest, confirm=True)
-        second = manager.cleanup(manifest, confirm=True)
-        protected = manager.plan({**manifest, "state": "complete", "worktree": str(main)})
-        return first["action"] == "cleaned" and second["action"] == "noop" and "main_checkout" in protected["issues"], {"first": first["action"], "second": second["action"], "main_action": protected["action"]}
+        first_result, first, manifest_path = cli_cleanup(root, main, worktree, "g10")
+        second_result, second, _ = cli_cleanup(root, main, worktree, "g10")
+        protected_result, protected, _ = cli_cleanup(root, main, main, "g10-main", confirm=False)
+        return (first_result.returncode == 0 and first.get("action") == "cleaned" and
+                second_result.returncode == 0 and second.get("action") == "noop" and
+                protected_result.returncode == 0 and protected.get("action") == "refuse" and "main_checkout" in protected.get("issues", [])), {
+                    "first": first.get("action"), "second": second.get("action"), "main_action": protected.get("action")}
+
 
 
 SCENARIOS = [("G1", "Session mismatch is detected", scenario_g1), ("G2", "Setup failure prevents worker launch", scenario_g2),

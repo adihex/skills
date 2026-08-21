@@ -92,6 +92,18 @@ class GitGateTests(unittest.TestCase):
         self.assertEqual(git_gate.completion_gate(git=git, review_status="blocked_external", checks_status="passed")["state"], "blocked_external")
         self.assertTrue(git_gate.completion_gate(git=git, review_status="approved", checks_status="passed")["ok"])
 
+    def test_worker_report_is_validated_before_completion_claim(self):
+        path = self.worktree / "report.txt"
+        path.write_text("\n".join([
+            "RESULT: complete", f"WORKTREE: {self.worktree}", "BRANCH: feature/test", "COMMIT: abc123",
+            "PUSHED: abc123", "PR: 7", "CODERABBIT: approved", "CHECKS: passed", "CLEANUP: verified",
+            "BLOCKER: none", "EVIDENCE: test-artifacts",
+        ]) + "\n", encoding="utf-8")
+        result = git_gate.parse_worker_report(str(path), expected_worktree=str(self.worktree), expected_branch="feature/test")
+        self.assertEqual(result["PR"], "7")
+        path.write_text(path.read_text().replace("CLEANUP: verified", "CLEANUP: pending"), encoding="utf-8")
+        self.assertEqual(self.error_code(lambda: git_gate.parse_worker_report(str(path))), "REPORT_COMPLETION_EVIDENCE_MISSING")
+
 
 if __name__ == "__main__":
     unittest.main()

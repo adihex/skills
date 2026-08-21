@@ -39,6 +39,14 @@ class ManifestStore:
         self.events_path = self.directory / "events.jsonl"
         self.directory.mkdir(parents=True, exist_ok=True)
 
+    @classmethod
+    def from_path(cls, path: str | os.PathLike[str]) -> "ManifestStore":
+        file_path = Path(path)
+        store = cls(file_path.parent)
+        store.manifest_path = file_path
+        store.lock_path = file_path.with_name(file_path.name + ".lock")
+        store.events_path = file_path.with_name(file_path.name + ".events.jsonl")
+        return store
     @contextmanager
     def _lock(self) -> Iterator[None]:
         with self.lock_path.open("a+", encoding="utf-8") as lock:

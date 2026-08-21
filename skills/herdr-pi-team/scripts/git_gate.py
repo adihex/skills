@@ -16,6 +16,53 @@ class GateError(RuntimeError):
         self.details = details or {}
 
 
+REPORT_FIELDS = ("RESULT", "WORKTREE", "BRANCH", "COMMIT", "PUSHED", "PR", "CODERABBIT", "CHECKS", "CLEANUP", "BLOCKER", "EVIDENCE")
+REPORT_VALUES = {
+    "RESULT": {"complete", "blocked_external", "blocked", "failed"},
+    "CODERABBIT": {"approved", "changes_requested", "rate_limited", "not_run", "blocked"},
+    "CHECKS": {"passed", "failed_touched_scope", "failed_unrelated", "skipped_expected", "pending", "external_blocked"},
+    "CLEANUP": {"verified", "pending", "refused", "failed", "not_applicable"},
+}
+
+
+def parse_worker_report(path: str, *, expected_worktree: str | None = None, expected_branch: str | None = None) -> dict:
+    """Parse and validate the exact worker report contract without executing its contents."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise GateError("REPORT_UNREADABLE", "worker report is not readable", details={"path": path}) from exc
+    values = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if key in REPORT_FIELDS:
+            if key in values:
+                raise GateError("REPORT_DUPLICATE_FIELD", f"worker report repeats {key}")
+            values[key] = value
+    missing = [key for key in REPORT_FIELDS if not values.get(key)]
+    if missing:
+        raise GateError("REPORT_FIELDS_MISSING", "worker report is missing fields", details={"fields": missing})
+    for key, allowed in REPORT_VALUES.items():
+        if values[key] not in allowed:
+            raise GateError("REPORT_VALUE_INVALID", f"invalid {key} value", details={"value": values[key]})
+    if expected_worktree and Path(values["WORKTREE"]).resolve() != Path(expected_worktree).resolve():
+        raise GateError("REPORT_WORKTREE_MISMATCH", "report worktree does not match manifest")
+    if expected_branch and values["BRANCH"] != expected_branch:
+        raise GateError("REPORT_BRANCH_MISMATCH", "report branch does not match manifest")
+    if values["RESULT"] == "complete":
+        required = {
+            "COMMIT": values["COMMIT"] != "none", "PUSHED": values["PUSHED"] != "none",
+            "PR": values["PR"] != "none", "CODERABBIT": values["CODERABBIT"] == "approved",
+            "CHECKS": values["CHECKS"] in {"passed", "skipped_expected"}, "CLEANUP": values["CLEANUP"] == "verified",
+        }
+        failed = [key for key, valid in required.items() if not valid]
+        if failed:
+            raise GateError("REPORT_COMPLETION_EVIDENCE_MISSING", "complete report lacks evidence", details={"fields": failed})
+    return values
+
+
 def verify_push_invocation(argv: list[str]) -> None:
     bad = [arg for arg in argv if arg in {"--force", "-f", "--no-verify"} or arg.startswith("--force=")]
     if bad:
