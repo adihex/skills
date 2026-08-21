@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -126,18 +125,41 @@ def backend_for(args, saved=None):
     return hax_backend.HaxBackend(hax_command=args.hax_command, codex_command=args.codex_command, auth_path=args.auth_path), config
 
 
-def wait_ready(pane_id, timeout, poll):
-    deadline = time.monotonic() + timeout
-    last = ""
-    while time.monotonic() < deadline:
-        result = run(["capture-pane", "-p", "-t", pane_id, "-S", "-20"])
-        if result.returncode == 0:
-            last = result.stdout
-            lowered = last.lower()
-            if any(marker in lowered for marker in ("ready", "ack", "❯", ">")):
-                return {"ready": True, "marker": "ready" if "ready" in lowered else "prompt"}
-        time.sleep(poll)
-    fail(2, "HAX_READINESS_TIMEOUT", "Hax did not expose a readiness marker", {"last_text_sha256": hashlib.sha256(last.encode()).hexdigest(), "last_text_chars": len(last)})
+class TmuxHaxTransport:
+    """Thin tmux transport; shared HaxBackend owns readiness and lifecycle."""
+
+    def start(self, worker, command):
+        shell_command = shlex.join(["exec", *command])
+        if worker["split"] == "spawn":
+            result = run(["new-window", "-P", "-F", "#{pane_id}", "-n", PREFIX + worker["label"], "-c", worker["cwd"], shell_command])
+        else:
+            result = run(["split-window", "-P", "-F", "#{pane_id}", "-h" if worker["split"] == "right" else "-v", "-c", worker["cwd"], shell_command])
+        if result.returncode:
+            raise hax_backend.HaxLifecycleError("LAUNCH_FAILED", result.stderr.strip() or "tmux launch failed")
+        pane_id = result.stdout.strip()
+        run(["select-pane", "-t", pane_id, "-T", PREFIX + worker["label"]])
+        return {"pane_id": pane_id, "title": PREFIX + worker["label"], "split": worker["split"]}
+
+    def read_state(self, worker):
+        result = run(["capture-pane", "-p", "-t", str(worker["pane_id"]), "-S", "-20"])
+        return {"text": result.stdout, "exit_code": result.returncode, "stderr": result.stderr}
+
+    def send(self, worker, text):
+        return send_literal(str(worker["pane_id"]), text)
+
+    def interrupt(self, worker):
+        result = run(["send-keys", "-t", str(worker["pane_id"]), "C-c"])
+        return {"exit_code": result.returncode}
+
+    def resume(self, worker):
+        raise hax_backend.HaxLifecycleError("HAX_RESUME_UNSUPPORTED", "tmux transport cannot prove Hax resume continuity")
+
+    def stop(self, worker):
+        result = run(["kill-pane", "-t", str(worker["pane_id"])])
+        return {"exit_code": result.returncode, "stderr": result.stderr[:200]}
+
+
+
 
 
 def send_literal(pane_id, text):
@@ -236,10 +258,12 @@ def main(argv=None):
     reconcile.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
     reconcile.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
     cleanup = sub.add_parser("cleanup")
-    cleanup.add_argument("--pattern", required=True)
+    cleanup.add_argument("--pattern", default=None)
+    cleanup.add_argument("--manifest", default=None)
     cleanup.add_argument("--dry-run", action="store_true")
     cleanup.add_argument("--confirm", action="store_true")
     cleanup.add_argument("--force", action="store_true")
+    add_backend_options(cleanup, suppress=True)
 
     args = parser.parse_args(argv)
     if args.version:
@@ -271,35 +295,40 @@ def main(argv=None):
     if args.cmd == "launch":
         brief = read_brief(args.brief_file)
         backend, config = backend_for(args)
+        cwd = os.path.abspath(args.cwd)
+        readiness = None
+        submission = None
         if config.backend == "hax":
-            try:
-                backend.preflight(config)
-            except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
-                fail(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc), getattr(exc, "details", None))
             if config.mode == "oneshot":
                 result = backend.run_oneshot(config, prompt=brief, cwd=args.cwd)
                 manifest = {"run_id": f"tmux-{int(time.time())}", "label": args.name, "workspace_id": "direct-oneshot", "pane_id": "direct-oneshot",
-                            "cwd": os.path.abspath(args.cwd), "worktree": os.path.abspath(args.cwd), "branch": "unknown", "state": result["state"],
+                            "cwd": cwd, "worktree": cwd, "branch": "unknown", "state": result["state"],
                             "blocker": result.get("code") if result["state"] != "verifying" else None, "backend_exit_code": result.get("exit_code"),
                             **config.manifest_fields(runtime="tmux")}
                 path = safe_manifest_path(args, args.name)
                 save_manifest(path, manifest)
                 emit({**manifest, "manifest_path": str(path), "stdout": result["stdout"], "stderr": result["stderr"], "command": result["command"]})
                 return
-            command = ["exec", *backend.build_command(config)]
+            transport = TmuxHaxTransport()
+            context = {"label": args.name, "cwd": cwd, "split": args.split}
+            try:
+                started = backend.start(context, config, transport)
+                worker = {**context, **started}
+                readiness = started["ready"]
+                submission = backend.send(worker, brief, transport)
+            except (hax_backend.HaxLifecycleError, hax_backend.HaxPreflightError) as exc:
+                fail(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+            pane_id = str(started["pane_id"])
         else:
             command = ["exec", "pi", "-e", os.path.expanduser(args.extension), "--model", MODEL, "--name", args.name, brief]
-        cwd = os.path.abspath(args.cwd)
-        if args.split == "spawn":
-            result = run(["new-window", "-P", "-F", "#{pane_id}", "-n", PREFIX + args.name, "-c", cwd, shlex.join(command)])
-        else:
-            result = run(["split-window", "-P", "-F", "#{pane_id}", "-h" if args.split == "right" else "-v", "-c", cwd, shlex.join(command)])
-        if result.returncode:
-            fail(2, "LAUNCH_FAILED", result.stderr.strip() or "tmux launch failed", "check tmux state")
-        pane_id = result.stdout.strip()
-        run(["select-pane", "-t", pane_id, "-T", PREFIX + args.name])
-        readiness = wait_ready(pane_id, 20, 0.2) if config.backend == "hax" else None
-        submission = send_literal(pane_id, brief) if config.backend == "hax" else None
+            if args.split == "spawn":
+                result = run(["new-window", "-P", "-F", "#{pane_id}", "-n", PREFIX + args.name, "-c", cwd, shlex.join(command)])
+            else:
+                result = run(["split-window", "-P", "-F", "#{pane_id}", "-h" if args.split == "right" else "-v", "-c", cwd, shlex.join(command)])
+            if result.returncode:
+                fail(2, "LAUNCH_FAILED", result.stderr.strip() or "tmux launch failed", "check tmux state")
+            pane_id = result.stdout.strip()
+            run(["select-pane", "-t", pane_id, "-T", PREFIX + args.name])
         manifest = {"run_id": f"tmux-{int(time.time())}", "label": args.name, "workspace_id": "tmux", "tab_id": "tmux", "pane_id": pane_id,
                     "cwd": cwd, "worktree": cwd, "branch": "unknown", "state": "working" if config.backend == "hax" else "ready",
                     "blocker": None, **config.manifest_fields(runtime="tmux")}
@@ -327,7 +356,14 @@ def main(argv=None):
             fail(2, "NOT_FOUND", "pane not found", "run list")
         if not target["isPi"] and not args.force:
             fail(3, "SAFETY_REFUSAL", "refusing non-worker pane", "use --force deliberately")
-        emit(send_literal(args.pane_id, args.text) | {"backend": config.backend})
+        if config.backend == "hax":
+            try:
+                submission = backend.send({"pane_id": args.pane_id, "runtime": "tmux"}, args.text, TmuxHaxTransport())
+            except hax_backend.HaxLifecycleError as exc:
+                fail(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+            emit(submission | {"backend": "hax"})
+        else:
+            emit(send_literal(args.pane_id, args.text) | {"backend": "pi"})
         return
 
     if args.cmd == "status":
@@ -353,6 +389,25 @@ def main(argv=None):
         return
 
     if args.cmd == "cleanup":
+        if args.manifest:
+            saved = read_manifest(args.manifest)
+            backend, config = backend_for(args, saved)
+            if config.backend == "hax":
+                pane_id = str(saved.get("pane_id") or saved.get("paneId") or "")
+                payload = {"runtime": "tmux", "backend": "hax", "dryRun": not args.confirm or args.dry_run, "pane_id": pane_id, "action": "plan"}
+                if payload["dryRun"]:
+                    emit(payload)
+                    return
+                try:
+                    shutdown = backend.stop({"pane_id": pane_id, "runtime": "tmux"}, TmuxHaxTransport())
+                except hax_backend.HaxLifecycleError as exc:
+                    fail(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+                saved["backend_shutdown"] = shutdown
+                save_manifest(args.manifest, saved)
+                emit({**payload, "action": "stopped", "shutdown": shutdown})
+                return
+        if not args.pattern:
+            fail(1, "USAGE", "cleanup needs --pattern or an Hax --manifest", "choose an explicit target")
         try:
             pattern = re.compile(args.pattern)
         except re.error as exc:

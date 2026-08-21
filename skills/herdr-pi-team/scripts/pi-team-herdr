@@ -57,7 +57,7 @@ def branch_for(cwd: str) -> str:
 
 def adapter(args):
     config = {"backend": getattr(args, "backend", "pi")}
-    if getattr(args, "command", None) in {"send", "status"} and getattr(args, "manifest", None):
+    if getattr(args, "command", None) in {"send", "status", "cleanup"} and getattr(args, "manifest", None):
         saved = store_module.ManifestStore.from_path(args.manifest).read() or {}
         if saved.get("backend"):
             config["backend"] = saved["backend"]
@@ -258,6 +258,10 @@ def main(argv=None):
             manifest.setdefault("session", args.session)
             manifest.setdefault("herdr_command", args.herdr_command)
             store = store_module.ManifestStore.from_path(args.manifest)
+            if args.confirm and manifest.get("backend") == "hax":
+                shutdown = mux.stop(manifest)
+                manifest["backend_shutdown"] = shutdown
+                store.write(manifest)
             manager = cleanup_module.CleanupManager(
                 worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
                 manifest_writer=store.write,

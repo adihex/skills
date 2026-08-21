@@ -8,6 +8,7 @@ module never reads or logs credential contents.
 from __future__ import annotations
 
 import os
+import time
 import re
 import shutil
 import subprocess
@@ -33,6 +34,15 @@ class HaxConfigError(ValueError):
 
 class HaxPreflightError(RuntimeError):
     """Raised when a Hax prerequisite is unavailable."""
+
+    def __init__(self, code: str, message: str, *, details: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
+
+
+class HaxLifecycleError(RuntimeError):
+    """Raised when a shared Hax lifecycle operation cannot proceed safely."""
 
     def __init__(self, code: str, message: str, *, details: Mapping[str, Any] | None = None):
         super().__init__(message)
@@ -230,6 +240,75 @@ class HaxBackend:
             result["codex_auth"] = "not_required"
         return result
 
+    def start(self, worker: Mapping[str, Any], config: BackendConfig, transport: Any) -> dict[str, Any]:
+        """Start an interactive worker through a runtime transport."""
+        config.validate()
+        if config.backend != "hax" or config.mode != "interactive":
+            raise HaxConfigError("INTERACTIVE_REQUIRED", "shared Hax start requires interactive Hax configuration")
+        self.preflight(config)
+        command = self.build_command(config)
+        result = transport.start(dict(worker), command)
+        if not isinstance(result, Mapping):
+            raise HaxLifecycleError("START_INVALID", "runtime transport returned an invalid start result")
+        started = dict(result)
+        ready_worker = {**dict(worker), **started}
+        started["ready"] = self.wait_ready(ready_worker, transport)
+        return {"command": self.redacted_command(command), **started}
+
+    def read_state(self, worker: Mapping[str, Any], transport: Any) -> dict[str, Any]:
+        """Read and conservatively classify runtime state without claiming completion."""
+        result = transport.read_state(dict(worker))
+        if not isinstance(result, Mapping):
+            raise HaxLifecycleError("READ_STATE_INVALID", "runtime transport returned an invalid state result")
+        text = str(result.get("text") or result.get("output") or "")
+        lowered = text.lower()
+        if "429" in lowered or "quota" in lowered or "rate limit" in lowered:
+            return {"state": "blocked_external", "code": "HTTP_429", "ready": False, "text_chars": len(text)}
+        ready = any(marker in lowered for marker in ("ready", "ack", "❯", ">"))
+        return {"state": "working" if ready else "unknown", "code": "interactive_prompt" if ready else "readiness_unknown",
+                "ready": ready, "text_chars": len(text), "transport": dict(result)}
+
+    def wait_ready(self, worker: Mapping[str, Any], transport: Any, *, timeout: float = 30.0, poll: float = 0.2) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = self.read_state(worker, transport)
+            if last.get("ready"):
+                return last
+            if last.get("state") == "blocked_external":
+                raise HaxLifecycleError(last["code"], "Hax became externally blocked while starting", details=last)
+            time.sleep(poll)
+        raise HaxLifecycleError("HAX_READINESS_TIMEOUT", "Hax did not expose a readiness marker", details={"last_state": last or {}})
+
+    def send(self, worker: Mapping[str, Any], text: str, transport: Any) -> dict[str, Any]:
+        state = self.read_state(worker, transport)
+        if not state["ready"]:
+            raise HaxLifecycleError("HAX_READINESS_TIMEOUT", "Hax is not ready for a task submission", details={"state": state["state"], "code": state["code"]})
+        result = transport.send(dict(worker), text)
+        if not isinstance(result, Mapping):
+            raise HaxLifecycleError("SEND_INVALID", "runtime transport returned an invalid send result")
+        return {"state": "working", "submitted": True, **dict(result)}
+
+    def interrupt(self, worker: Mapping[str, Any], transport: Any) -> dict[str, Any]:
+        result = transport.interrupt(dict(worker))
+        return {"interrupted": True, **dict(result or {})}
+
+    def resume(self, worker: Mapping[str, Any], transport: Any) -> dict[str, Any]:
+        if not self.capabilities_for_worker(worker).get("resume_supported", False):
+            raise HaxLifecycleError("HAX_RESUME_UNSUPPORTED", "installed Hax runtime cannot prove safe resume")
+        result = transport.resume(dict(worker))
+        return {"resumed": True, **dict(result or {})}
+
+    def stop(self, worker: Mapping[str, Any], transport: Any) -> dict[str, Any]:
+        result = transport.stop(dict(worker))
+        if isinstance(result, Mapping) and result.get("exit_code") not in (None, 0):
+            raise HaxLifecycleError("STOP_FAILED", "runtime transport failed to stop the Hax worker", details=result)
+        return {"stopped": True, "shutdown_diagnostics": dict(result or {})}
+
+    def capabilities_for_worker(self, worker: Mapping[str, Any]) -> dict[str, Any]:
+        capabilities = worker.get("backend_capabilities")
+        return dict(capabilities) if isinstance(capabilities, Mapping) else capabilities_for("hax", str(worker.get("runtime", "unknown")))
+
     def run_oneshot(self, config: BackendConfig, *, prompt: str, cwd: str | os.PathLike[str], timeout: float = 900.0) -> dict[str, Any]:
         """Run an explicit Hax one-shot request with separate stdout/stderr capture."""
         if config.backend != "hax" or config.mode != "oneshot":
@@ -272,5 +351,5 @@ def config_from_mapping(value: Mapping[str, Any] | None) -> BackendConfig:
 
 __all__ = [
     "AUTH_SOURCES", "BACKENDS", "EFFORTS", "HAX_MIN_VERSION", "MODES", "BackendConfig",
-    "HaxBackend", "HaxConfigError", "HaxPreflightError", "capabilities_for", "config_from_mapping",
+    "HaxBackend", "HaxConfigError", "HaxLifecycleError", "HaxPreflightError", "capabilities_for", "config_from_mapping",
 ]

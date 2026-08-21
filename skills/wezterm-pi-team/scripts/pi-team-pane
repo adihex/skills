@@ -5,7 +5,6 @@ AI-native CLI: JSON to stdout by default, --human for tables, structured errors 
 exit codes 0=ok / 1=usage / 2=runtime-wezterm / 3=safety-refusal. Stdlib only.
 """
 import argparse
-import hashlib
 import glob
 import importlib.util
 import json
@@ -13,7 +12,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import urllib.parse
 from collections import Counter
 from pathlib import Path
@@ -265,7 +263,48 @@ def fenced_send_submit(pid, text):
     return 0, "sent", ""
 
 
-# ---------------------------------------------------------------------------
+class WeztermHaxTransport:
+    """Thin WezTerm transport; shared HaxBackend owns readiness and lifecycle."""
+
+    def start(self, worker, command):
+        if worker["split"] == "spawn":
+            rc, out, err = wz(["spawn", "--new-window", "--cwd", worker["cwd"], "--"] + command)
+        else:
+            direction = {"right": "--right", "bottom": "--bottom", "left": "--left", "top": "--top"}[worker["split"]]
+            split_args = ["split-pane", "--pane-id", str(worker["host"]), direction, "--cwd", worker["cwd"]]
+            if worker.get("percent") is not None:
+                split_args += ["--percent", str(worker["percent"])]
+            rc, out, err = wz(split_args + ["--"] + command)
+        if rc != 0:
+            raise hax_backend.HaxLifecycleError("LAUNCH_FAILED", err or "WezTerm pane launch failed")
+        try:
+            pane_id = int(out.strip())
+        except ValueError as exc:
+            raise hax_backend.HaxLifecycleError("LAUNCH_INVALID", "WezTerm did not return a pane ID") from exc
+        title = "%s%s - %s" % (TITLE_PREFIX, worker["label"], os.path.basename(worker["cwd"]))
+        return {"pane_id": pane_id, "title": title, "split": worker["split"]}
+
+    def read_state(self, worker):
+        rc, text, err = get_pane_text(worker["pane_id"], lines=20)
+        return {"text": text, "exit_code": rc, "stderr": err}
+
+    def send(self, worker, text):
+        rc, phase, err = fenced_send_submit(worker["pane_id"], text)
+        if rc != 0:
+            raise hax_backend.HaxLifecycleError("HAX_SEND_FAILED", "WezTerm send failed during %s" % phase, details={"stderr": err})
+        return {"paneId": worker["pane_id"], "sent": True, "submitted": True, "fenced": True}
+
+    def interrupt(self, worker):
+        rc, out, err = wz(["send-text", "--pane-id", str(worker["pane_id"]), "--no-paste", "\u0003"])
+        return {"exit_code": rc, "stderr": err}
+
+    def resume(self, worker):
+        raise hax_backend.HaxLifecycleError("HAX_RESUME_UNSUPPORTED", "WezTerm transport cannot prove Hax resume continuity")
+
+    def stop(self, worker):
+        rc, out, err = wz(["kill-pane", "--pane-id", str(worker["pane_id"])])
+        return {"exit_code": rc, "stderr": err[:200]}
+
 # commands
 # ---------------------------------------------------------------------------
 
@@ -303,13 +342,20 @@ def do_launch(args):
     if host is None:
         fail(2, "WEZTERM_PANE is not set", "run this from inside a WezTerm pane (or set WEZTERM_PANE)")
     list_panes()  # preflight: reachable mux before we spawn anything
+    if config.backend == "hax":
+        transport = WeztermHaxTransport()
+        context = {"label": args.name, "cwd": cwd, "host": host, "split": args.split, "percent": args.percent}
+        try:
+            started = backend.start(context, config, transport)
+        except (hax_backend.HaxLifecycleError, hax_backend.HaxPreflightError) as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        pane_id = int(started["pane_id"])
+        return pane_id, started["split"], started["title"], " ".join(home_display(str(value)) for value in backend.build_command(config)), config
+
 
     ext = os.path.expanduser(args.extension or EXTENSION_DEFAULT)
     model = getattr(args, "model", None) or MODEL_DEFAULT
-    if config.backend == "hax":
-        worker_prog = backend.build_command(config)
-    else:
-        worker_prog = ["pi", "-e", ext, "--model", model, "--name", args.name, "@" + brief_file]
+    worker_prog = ["pi", "-e", ext, "--model", model, "--name", args.name, "@" + brief_file]
     if args.split == "spawn":
         if args.percent is not None:
             fail(1, "--percent only applies to split panes",
@@ -335,18 +381,6 @@ def do_launch(args):
     return new_pid, split, title, command_display, config
 
 
-def wait_hax_ready(pid, timeout=30.0):
-    deadline = time.monotonic() + timeout
-    last = ""
-    while time.monotonic() < deadline:
-        rc, text, err = get_pane_text(pid, lines=20)
-        if rc == 0:
-            last = text
-            lowered = text.lower()
-            if any(marker in lowered for marker in ("ready", "ack", "❯", ">")):
-                return {"ready": True, "marker": "ready" if "ready" in lowered else "prompt"}
-        time.sleep(0.2)
-    fail_code(2, "HAX_READINESS_TIMEOUT", "Hax did not expose a readiness marker", {"last_text_sha256": hashlib.sha256(last.encode()).hexdigest(), "last_text_chars": len(last)})
 
 
 def cmd_launch(args):
@@ -371,13 +405,13 @@ def cmd_launch(args):
         pid, split, title, command_display, config = do_launch(args)
     except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
         fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
-    readiness = wait_hax_ready(pid) if config.backend == "hax" else None
+    readiness = {"ready": True, "code": "interactive_prompt"} if config.backend == "hax" else None
     submission = None
     if config.backend == "hax":
-        submission_rc, phase, error = fenced_send_submit(pid, Path(args.brief_file).read_text(encoding="utf-8"))
-        if submission_rc:
-            fail_code(2, "HAX_SEND_FAILED", "Hax prompt failed during %s: %s" % (phase, error), "check the target pane")
-        submission = {"paneId": pid, "sent": True, "submitted": True, "fenced": True}
+        try:
+            submission = backend.send({"pane_id": pid, "runtime": "wezterm"}, Path(args.brief_file).read_text(encoding="utf-8"), WeztermHaxTransport())
+        except hax_backend.HaxLifecycleError as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
     manifest = {"run_id": "wezterm-%s" % pid, "label": args.name, "workspace_id": "wezterm", "tab_id": "wezterm", "pane_id": pid,
                 "cwd": os.path.abspath(args.cwd or os.getcwd()), "worktree": os.path.abspath(args.cwd or os.getcwd()), "branch": "unknown",
                 "state": "working" if config.backend == "hax" else "ready", "blocker": None, **config.manifest_fields(runtime="wezterm")}
@@ -419,10 +453,17 @@ def cmd_send(args):
              "wait for an idle prompt, omit --require-idle, or pass --force for a deliberate override")
 
     text = args.text
-    rc, phase, err = fenced_send_submit(pid, text)
-    if rc != 0:
-        fail(2, "send-text to pane %s failed during %s: %s" % (pid, phase, err), "check wezterm state")
-    emit({"paneId": pid, "sent": True, "chars": len(text), "cliState": cli_state, "fenced": True, "backend": config.backend})  # never echo text
+    if config.backend == "hax":
+        try:
+            submission = backend.send({"pane_id": pid, "runtime": "wezterm"}, text, WeztermHaxTransport())
+        except hax_backend.HaxLifecycleError as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        emit(submission | {"backend": "hax", "cliState": cli_state})
+    else:
+        rc, phase, err = fenced_send_submit(pid, text)
+        if rc != 0:
+            fail(2, "send-text to pane %s failed during %s: %s" % (pid, phase, err), "check wezterm state")
+        emit({"paneId": pid, "sent": True, "chars": len(text), "cliState": cli_state, "fenced": True, "backend": "pi"})  # never echo text
 
 
 def cmd_focus(args):
@@ -549,9 +590,26 @@ def cmd_status(args):
 
 
 def cmd_cleanup(args):
+    if args.manifest:
+        saved = read_manifest(args.manifest)
+        backend, config = backend_for_args(args, saved)
+        if config.backend == "hax":
+            pane_id = int(saved.get("pane_id") or saved.get("paneId") or 0)
+            payload = {"runtime": "wezterm", "backend": "hax", "dryRun": not args.confirm or args.dry_run, "pane_id": pane_id, "action": "plan"}
+            if payload["dryRun"]:
+                emit(payload)
+                return
+            try:
+                shutdown = backend.stop({"pane_id": pane_id, "runtime": "wezterm"}, WeztermHaxTransport())
+            except hax_backend.HaxLifecycleError as exc:
+                fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+            saved["backend_shutdown"] = shutdown
+            save_manifest(args.manifest, saved)
+            emit({**payload, "action": "stopped", "shutdown": shutdown})
+            return
     pattern = args.pattern
     if not pattern:
-        fail(1, "cleanup requires --pattern", "e.g. --pattern 'proto-|team-'")
+        fail(1, "cleanup requires --pattern or an Hax --manifest", "choose an explicit target")
     try:
         rx = re.compile(pattern)
     except re.error as e:
@@ -661,16 +719,20 @@ def delegate_lifecycle(args):
     raise SystemExit(result.returncode)
 
 def cmd_launch_dispatch(args):
+    backend, _ = backend_for_args(args)
     pid, split, title, pi_cmd, config = do_launch(args)
-    if config.backend == "hax":
-        wait_hax_ready(pid)
     text = args.dispatch_instruction
+    if config.backend == "hax":
+        try:
+            backend.send({"pane_id": pid, "runtime": "wezterm"}, text, WeztermHaxTransport())
+        except hax_backend.HaxLifecycleError as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True, "backend": "hax"})
+        return
     rc, phase, err = fenced_send_submit(pid, text)
     if rc != 0:
-        fail(2, "launch succeeded but dispatch send failed during %s: %s" % (phase, err),
-             "worker pane %s is live; resend with: pi-team-pane send --pane-id %s --text '<instruction>'"
-             % (pid, pid))
-    emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True})
+        fail(2, "launch succeeded but dispatch send failed during %s: %s" % (phase, err), "worker pane is live; resend with pi-team-pane send")
+    emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True, "backend": "pi"})
 
 
 # ---------------------------------------------------------------------------
@@ -769,12 +831,14 @@ def build_parser():
     p_status.add_argument("--manifest", default=None, help="worker manifest for backend-aware status")
 
     p_cleanup = sub.add_parser("cleanup", help="clean stale panes by title regex (dry-run by default)")
-    p_cleanup.add_argument("--pattern", required=True, help="regex matched against pane title/label")
+    p_cleanup.add_argument("--pattern", default=None, help="regex matched against pane title/label")
+    p_cleanup.add_argument("--manifest", default=None, help="exact backend-owned worker manifest")
     p_cleanup.add_argument("--dry-run", action="store_true", help="explicit dry run (default mode)")
     p_cleanup.add_argument("--confirm", action="store_true", help="actually kill matched panes")
     p_cleanup.add_argument("--force", action="store_true",
                            help="allow matching non-pi panes; pane 0/current/last-pane protection remains absolute")
     p_cleanup.add_argument("--human", action="store_true", help="human-readable listing")
+    add_backend_args(p_cleanup)
 
     p_lad = sub.add_parser("launch-and-dispatch", help="launch a named pi agent, then send its dispatch instruction")
     p_lad.add_argument("--name", required=True, help="worker label")

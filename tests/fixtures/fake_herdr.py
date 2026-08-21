@@ -41,6 +41,8 @@ def main():
         emit({"status": "queued" if scenario == "setup-timeout" else "ready"})
     elif args[:2] == ["workspace", "close"]:
         emit({"ok": True})
+    elif args[:2] == ["agent", "stop"]:
+        emit({"ok": True})
     elif args[:2] == ["agent", "start"]:
         emit({"tab_id": "tab-1", "pane_id": "pane-1"})
     elif args[:2] == ["agent", "send"]:

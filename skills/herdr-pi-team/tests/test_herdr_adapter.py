@@ -151,6 +151,14 @@ class HerdrAdapterTests(unittest.TestCase):
         if self.log.exists():
             self.assertNotIn("workspace create", self.log.read_text())
 
+    def test_hax_stop_uses_owned_agent_target(self):
+        adapter = self.adapter(backend_config={"backend": "hax", "provider": "codex", "model": "gpt-5.6-sol", "auth_source": "hax_managed"},
+                               hax_command=str(FAKE_HAX), codex_command=str(FAKE_HAX))
+        manifest = {"backend": "hax", "runtime": "herdr", "pane_id": "pane-1"}
+        result = adapter.stop(manifest)
+        self.assertTrue(result["stopped"])
+        self.assertIn("agent stop", self.log.read_text())
+
 
 
 if __name__ == "__main__":

@@ -105,6 +105,53 @@ class HaxBackendTests(unittest.TestCase):
         self.assertEqual(self.backend.classify(returncode=0)["code"], "process_exit_0")
         self.assertEqual(self.backend.classify(returncode=1)["code"], "process_exit_nonzero")
 
+    def test_shared_lifecycle_delegates_transport_and_stops_owned_process(self):
+        class Transport:
+            def __init__(self):
+                self.calls = []
+
+            def start(self, worker, command):
+                self.calls.append(("start", command))
+                return {"session_id": "hax-session"}
+
+            def read_state(self, worker):
+                self.calls.append(("read_state", worker["pane_id"]))
+                return {"text": "READY >"}
+
+            def send(self, worker, text):
+                self.calls.append(("send", text))
+                return {"acknowledged": True}
+
+            def interrupt(self, worker):
+                self.calls.append(("interrupt", worker["pane_id"]))
+                return {"signal": "interrupt"}
+
+            def resume(self, worker):
+                self.calls.append(("resume", worker["pane_id"]))
+                return {"session_id": "hax-session"}
+
+            def stop(self, worker):
+                self.calls.append(("stop", worker["pane_id"]))
+                return {"processes_stopped": 1}
+
+        transport = Transport()
+        worker = {"pane_id": "pane-1", "runtime": "tmux", "backend_capabilities": {"resume_supported": False}}
+        config = self.config()
+        started = self.backend.start(worker, config, transport)
+        state = self.backend.read_state(worker, transport)
+        sent = self.backend.send(worker, "task", transport)
+        interrupted = self.backend.interrupt(worker, transport)
+        stopped = self.backend.stop(worker, transport)
+        self.assertEqual(started["session_id"], "hax-session")
+        self.assertEqual(state["code"], "interactive_prompt")
+        self.assertTrue(sent["submitted"])
+        self.assertTrue(interrupted["interrupted"])
+        self.assertEqual(stopped["shutdown_diagnostics"]["processes_stopped"], 1)
+        self.assertEqual([call[0] for call in transport.calls], ["start", "read_state", "read_state", "read_state", "send", "interrupt", "stop"])
+        with self.assertRaises(MODULE.HaxLifecycleError) as resume:
+            self.backend.resume(worker, transport)
+        self.assertEqual(resume.exception.code, "HAX_RESUME_UNSUPPORTED")
+
     def test_oneshot_captures_streams_and_classifies_exit(self):
         result = self.backend.run_oneshot(self.config(mode="oneshot"), prompt="hello", cwd=str(ROOT))
         self.assertEqual(result["exit_code"], 0)

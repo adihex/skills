@@ -108,6 +108,27 @@ class RuntimeBackendTests(unittest.TestCase):
             self.assertFalse(log.exists())
             self.assertEqual(payload["backend_capabilities"]["steerable"], False)
 
+    def test_backend_owned_cleanup_stops_exact_hax_targets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"backend": "hax", "runtime": "tmux", "pane_id": "%1", "backend_config": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "high", "mode": "interactive", "auth_source": "hax_managed"}}), encoding="utf-8")
+            tmux_log = root / "tmux-stop.log"
+            tmux = self.run_cli(TMUX, ["cleanup", "--manifest", str(manifest), "--confirm", "--hax-command", str(FAKE_HAX), "--codex-command", str(FAKE_HAX)],
+                                self.env(PI_TEAM_TMUX_COMMAND=str(FAKE_TMUX), FAKE_TMUX_LOG=str(tmux_log)))
+            self.assertEqual(tmux.returncode, 0, tmux.stderr)
+            self.assertEqual(json.loads(tmux.stdout)["action"], "stopped")
+            self.assertIn("kill-pane", tmux_log.read_text())
+
+            manifest.write_text(json.dumps({"backend": "hax", "runtime": "wezterm", "pane_id": 2, "backend_config": {"provider": "codex", "model": "gpt-5.6-sol", "effort": "high", "mode": "interactive", "auth_source": "hax_managed"}}), encoding="utf-8")
+            wez_log = root / "wez-stop.log"
+            wez = self.run_cli(WEZTERM, ["cleanup", "--manifest", str(manifest), "--confirm", "--hax-command", str(FAKE_HAX), "--codex-command", str(FAKE_HAX)],
+                               self.env(PI_TEAM_WEZTERM_COMMAND=str(FAKE_WEZTERM), FAKE_WEZTERM_PANES="coexist", WEZTERM_PANE="1", FAKE_WEZTERM_LOG=str(wez_log)))
+            self.assertEqual(wez.returncode, 0, wez.stderr)
+            self.assertEqual(json.loads(wez.stdout)["action"], "stopped")
+            self.assertIn("kill-pane", wez_log.read_text())
+
+
 
 if __name__ == "__main__":
     unittest.main()

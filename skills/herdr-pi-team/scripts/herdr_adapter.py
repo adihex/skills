@@ -35,6 +35,36 @@ class AdapterError(RuntimeError):
         self.code = code
         self.details = details or {}
 
+class HerdrHaxTransport:
+    """Thin Herdr transport; shared HaxBackend owns lifecycle decisions."""
+
+    def __init__(self, adapter: "HerdrAdapter"):
+        self.adapter = adapter
+
+    def start(self, worker: dict, command: list[str]) -> dict:
+        args = ["agent", "start", worker["label"], "--cwd", os.path.abspath(worker["cwd"]),
+                "--workspace", str(worker["workspace_id"]), "--", *command]
+        result = self.adapter._json(self.adapter._run(args), "agent start")
+        return {"worker": result, "pane_id": str(result.get("pane_id") or result.get("id") or ""),
+                "tab_id": str(result.get("tab_id") or ""), "workspace_id": str(worker["workspace_id"])}
+
+    def read_state(self, worker: dict) -> dict:
+        return self.adapter._json(self.adapter._run(["pane", "read", str(worker["pane_id"]), "--lines", "20"]), "pane read")
+
+    def send(self, worker: dict, text: str) -> dict:
+        return self.adapter._send_transport(worker, text)
+
+    def interrupt(self, worker: dict) -> dict:
+        result = self.adapter._run(["pane", "send-keys", str(worker["pane_id"]), "ctrl-c"])
+        return {"exit_code": result.returncode}
+
+    def resume(self, worker: dict) -> dict:
+        raise hax_backend.HaxLifecycleError("HAX_RESUME_UNSUPPORTED", "Herdr Hax transport cannot prove resume continuity")
+
+    def stop(self, worker: dict) -> dict:
+        result = self.adapter._run(["agent", "stop", str(worker["pane_id"])])
+        return {"exit_code": result.returncode, "stderr": result.stderr[:200]}
+
 
 class HerdrAdapter:
     def __init__(self, *, session: str | None = None, herdr_command: str = "herdr",
@@ -51,6 +81,7 @@ class HerdrAdapter:
         self.poll_interval = poll_interval
         self.config = hax_backend.BackendConfig.from_mapping(backend_config)
         self.hax = hax_backend.HaxBackend(hax_command=hax_command, codex_command=codex_command, auth_path=auth_path)
+        self.hax_transport = HerdrHaxTransport(self)
         self._resolved_session: str | None = None
     def _command(self) -> str:
         command = self.herdr_command
@@ -130,17 +161,6 @@ class HerdrAdapter:
     def _pane_rows(result: dict) -> list[dict]:
         panes = result.get("panes", [])
         return panes if isinstance(panes, list) else []
-    def _wait_hax_ready(self, pane_id: str) -> dict:
-        deadline = time.monotonic() + self.timeout
-        last_text = ""
-        while time.monotonic() < deadline:
-            readback = self._json(self._run(["pane", "read", pane_id, "--lines", "20"]), "pane read")
-            last_text = str(readback.get("text") or readback.get("output") or "")
-            lowered = last_text.lower()
-            if any(marker in lowered for marker in ("ready", "ack", "❯", ">")):
-                return {"ready": True, "marker": "ready" if "ready" in lowered else "prompt"}
-            time.sleep(self.poll_interval)
-        raise AdapterError("HAX_READINESS_TIMEOUT", "Hax did not expose a readiness marker", details={"pane_id": pane_id, "last_text_sha256": hashlib.sha256(last_text.encode()).hexdigest(), "last_text_chars": len(last_text)})
 
     def launch(self, *, run_id: str, label: str, cwd: str, worktree: str, branch: str,
                brief_file: str, workspace_id: str | None = None, model: str = "opencode/deepseek-v4-flash-free",
@@ -180,15 +200,20 @@ class HerdrAdapter:
             setup = self._json(self._run(["workspace", "status", workspace_id]), "workspace status")
         if setup.get("status") not in {"ready", "complete", "completed", "ok"}:
             raise AdapterError("SETUP_FAILED", "workspace setup failed", details={"workspace_id": workspace_id, "setup": setup, "setup_duration_seconds": round(time.monotonic() - started, 3)})
+        worker_context = {"label": label, "cwd": cwd, "workspace_id": workspace_id}
+        hax_lifecycle = {}
         if self.config.backend == "hax":
-            worker_command = self.hax.build_command(self.config)
+            try:
+                hax_lifecycle = self.hax.start(worker_context, self.config, self.hax_transport)
+            except hax_backend.HaxLifecycleError as exc:
+                raise AdapterError(exc.code, str(exc), details=exc.details) from exc
+            worker = hax_lifecycle.get("worker", {})
         else:
             worker_command = [self.pi_command, "-e", self.extension, "--model", model]
             if thinking:
                 worker_command += ["--thinking", thinking]
             worker_command += ["--name", label, "@" + os.path.abspath(brief_file)]
-        command = ["agent", "start", label, "--cwd", os.path.abspath(cwd), "--workspace", workspace_id, "--", *worker_command]
-        worker = self._json(self._run(command), "agent start")
+            worker = self._json(self._run(["agent", "start", label, "--cwd", os.path.abspath(cwd), "--workspace", workspace_id, "--", *worker_command]), "agent start")
         manifest = {
             "run_id": run_id, "label": label, "workspace_id": workspace_id,
             "tab_id": str(worker.get("tab_id") or ""), "pane_id": str(worker.get("pane_id") or worker.get("id") or ""),
@@ -202,13 +227,17 @@ class HerdrAdapter:
         if not manifest["pane_id"]:
             raise AdapterError("INVALID_RESPONSE", "agent start returned no pane ID")
         if self.config.backend == "hax":
-            readiness = self._wait_hax_ready(manifest["pane_id"])
-            submission = self.send(manifest, brief_text, acknowledge="ACKNOWLEDGED")
+            try:
+                readiness = hax_lifecycle.get("ready") or {}
+                if not readiness.get("ready"):
+                    raise hax_backend.HaxLifecycleError(readiness.get("code", "HAX_READINESS_TIMEOUT"), "Hax did not become ready")
+                submission = self.hax.send(manifest, brief_text, self.hax_transport)
+            except hax_backend.HaxLifecycleError as exc:
+                raise AdapterError(exc.code, str(exc), details=exc.details) from exc
             manifest.update({"state": "working", "hax_readiness": readiness, "hax_submission": submission})
         return manifest
 
-    def send(self, manifest: dict, text: str, *, acknowledge: str | None = None) -> dict:
-        self._ensure_preflight()
+    def _send_transport(self, manifest: dict, text: str, *, acknowledge: str | None = None) -> dict:
         pane_id = str(manifest.get("pane_id") or "")
         if not pane_id:
             raise AdapterError("TARGET_INVALID", "manifest has no pane_id")
@@ -229,6 +258,23 @@ class HerdrAdapter:
             raise AdapterError("ACK_NOT_CONFIRMED", "message submission was not acknowledged by pane readback", details={"pane_id": pane_id})
         return {"pane_id": pane_id, "sent": True, "submitted": True, "acknowledged": True,
                 "chars": len(text), "readback_sha256": hashlib.sha256(visible.encode()).hexdigest()}
+
+    def send(self, manifest: dict, text: str, *, acknowledge: str | None = None) -> dict:
+        self._ensure_preflight()
+        if self.config.backend == "hax":
+            try:
+                return self.hax.send(manifest, text, self.hax_transport)
+            except hax_backend.HaxLifecycleError as exc:
+                raise AdapterError(exc.code, str(exc), details=exc.details) from exc
+        return self._send_transport(manifest, text, acknowledge=acknowledge)
+
+    def stop(self, manifest: dict) -> dict:
+        if self.config.backend != "hax":
+            return {"stopped": False, "backend": "pi", "reason": "native Pi stop remains runtime-owned"}
+        try:
+            return self.hax.stop(manifest, self.hax_transport)
+        except hax_backend.HaxLifecycleError as exc:
+            raise AdapterError(exc.code, str(exc), details=exc.details) from exc
 
     def status(self, manifest: dict) -> dict:
         native = self._ensure_preflight()
