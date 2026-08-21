@@ -55,6 +55,7 @@
       }
     },
     "backend_capabilities": {"type": "object"},
+    "backend_limitations": {"type": "array", "items": {"type": "string"}},
     "backend_session_id": {"type": ["string", "null"]},
     "backend_exit_code": {"type": ["integer", "null"]},
     "backend_error_code": {"type": ["string", "null"]}

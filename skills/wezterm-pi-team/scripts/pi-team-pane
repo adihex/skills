@@ -512,6 +512,7 @@ def cmd_status_tail(panes, args):
 
 def cmd_status(args):
     panes, cur = list_panes()  # preflight + live join data
+    saved = read_manifest(args.manifest)
     if args.tail is not None:
         cmd_status_tail(panes, args)
         return
@@ -525,7 +526,11 @@ def cmd_status(args):
         candidates = sorted(glob.glob(os.path.join(root, "dispatch-*")),
                             key=lambda d: os.path.getmtime(d), reverse=True)
         if not candidates:
-            emit({"root": root, "dir": None, "dispatch": None, "workers": []})
+            backend_name = saved.get("backend", "pi")
+            mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+            emit({"root": root, "dir": None, "dispatch": None, "runtime": "wezterm", "backend": backend_name,
+                  "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm"),
+                  "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode), "workers": []})
             return
         dispatch_dir = candidates[0]
 
@@ -554,18 +559,25 @@ def cmd_status(args):
     workers, matched = [], []
     for label in sorted(by_label):
         rec = by_label[label]
+        backend_name = rec.get("backend", "pi")
+        mode = (rec.get("backend_config") or {}).get("mode", "interactive")
+        capabilities = rec.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm")
+        limitations = rec.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode)
         w = {"label": label, "status": rec.get("status"), "activity": rec.get("activity"),
-             "turn": rec.get("turn"), "updatedAt": rec.get("updatedAt"),
-             "source": rec.get("source"), "paneId": None}
+             "turn": rec.get("turn"), "updatedAt": rec.get("updatedAt"), "source": rec.get("source"), "paneId": None,
+             "backend": backend_name, "runtime": rec.get("runtime", "wezterm"), "backend_capabilities": capabilities,
+             "backend_limitations": limitations}
         p = pane_by_label.get(label)
         if p is not None:
             w["paneId"] = p["paneId"]
             matched.append({"paneId": p["paneId"], "title": p["title"], "label": label})
         workers.append(w)
-
-    saved = read_manifest(args.manifest)
-    payload = {"root": root, "dir": dispatch_dir, "dispatch": dispatch,
-               "backend": saved.get("backend", "pi"), "runtime": "wezterm", "workers": workers, "panes": matched}
+    backend_name = saved.get("backend", "pi")
+    mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+    payload = {"root": root, "dir": dispatch_dir, "dispatch": dispatch, "backend": backend_name, "runtime": "wezterm",
+               "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm"),
+               "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode),
+               "workers": workers, "panes": matched}
     if args.human:
         lines = ["root:    %s" % payload["root"]]
         if payload["dir"]:

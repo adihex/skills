@@ -383,9 +383,18 @@ def main(argv=None):
         for row in live:
             if row["isPi"]:
                 record = by_pane.get(row["paneId"], {})
-                workers.append({"paneId": row["paneId"], "label": row["label"], "backend": record.get("backend", "pi"),
-                                "runtime": record.get("runtime", "tmux"), "state": record.get("state", "unknown")})
-        emit({"runtime": "tmux", "workers": workers})
+                backend_name = record.get("backend", "pi")
+                mode = (record.get("backend_config") or {}).get("mode", "interactive")
+                capabilities = record.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "tmux")
+                limitations = record.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode)
+                workers.append({"paneId": row["paneId"], "label": row["label"], "backend": backend_name,
+                                "runtime": record.get("runtime", "tmux"), "state": record.get("state", "unknown"),
+                                "backend_capabilities": capabilities, "backend_limitations": limitations})
+        backend_name = saved.get("backend", "pi")
+        mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+        emit({"runtime": "tmux", "backend": backend_name,
+              "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "tmux"),
+              "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode), "workers": workers})
         return
 
     if args.cmd == "cleanup":

@@ -30,12 +30,14 @@ Do not add generated status directories or manifests to the repository. Keep man
 python3 scripts/validate_skills.py
 python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s skills/herdr-pi-team/tests -v
+python3 -m unittest discover -s skills/tmux-pi-team/tests -v
+python3 -m unittest discover -s skills/wezterm-pi-team/tests -v
 python3 -m compileall -q skills scripts tests
 python3 skills/pi-dogfood-os/scripts/run-golden --all --json
 python3 skills/pi-dogfood-os/scripts/run-hax-golden --json
-python3 -m compileall -q skills scripts tests
 git diff --check
 ```
+Python runtime scripts are checked with Ruff and compileall; ShellCheck is run only on files ending in `.sh`.
 
 The golden gate runs G1–G10 against fake Herdr/Git/GitHub commands and disposable temporary Git repositories. It never requires GitHub authentication or deletes a real checkout. A failed scenario blocks release.
 ## Hax backend

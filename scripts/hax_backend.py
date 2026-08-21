@@ -122,6 +122,7 @@ class BackendConfig:
                 "hax_min_version": self.hax_min_version,
             },
             "backend_capabilities": capability_fields,
+            "backend_limitations": limitations_for(self.backend, self.mode),
             "backend_session_id": None,
             "backend_exit_code": None,
             "backend_error_code": None,
@@ -142,6 +143,17 @@ def capabilities_for(backend: str = "hax", runtime: str = "unknown") -> dict[str
         "native_state": False, "subscription_auth": True, "steerable": True,
         "resume_supported": False, "requires_explicit_model": True,
     }
+def limitations_for(backend: str = "hax", mode: str = "interactive") -> list[str]:
+    if backend == "pi":
+        return []
+    if backend != "hax":
+        raise HaxConfigError("BACKEND_UNSUPPORTED", f"unsupported backend: {backend}")
+    limitations = ["native_state_unavailable", "resume_unverified"]
+    if mode == "oneshot":
+        limitations.append("live_steering_unavailable")
+    return limitations
+
+
 
 
 def _version_tuple(value: str) -> tuple[int, int, int] | None:
@@ -351,5 +363,5 @@ def config_from_mapping(value: Mapping[str, Any] | None) -> BackendConfig:
 
 __all__ = [
     "AUTH_SOURCES", "BACKENDS", "EFFORTS", "HAX_MIN_VERSION", "MODES", "BackendConfig",
-    "HaxBackend", "HaxConfigError", "HaxLifecycleError", "HaxPreflightError", "capabilities_for", "config_from_mapping",
+    "HaxBackend", "HaxConfigError", "HaxLifecycleError", "HaxPreflightError", "capabilities_for", "config_from_mapping", "limitations_for",
 ]
