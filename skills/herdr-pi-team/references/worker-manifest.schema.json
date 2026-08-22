@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "worker-manifest.schema.json",
+  "title": "Agentic orchestration worker manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "run_id", "label", "workspace_id", "tab_id", "pane_id", "cwd",
+    "worktree", "branch", "upstream", "state", "head_sha", "pushed_sha",
+    "pr_number", "review_status", "checks_status", "last_heartbeat", "blocker"
+  ],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "label": {"type": "string", "minLength": 1},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "tab_id": {"type": "string", "minLength": 1},
+    "pane_id": {"type": "string", "minLength": 1},
+    "cwd": {"type": "string", "pattern": "^/"},
+    "worktree": {"type": "string", "pattern": "^/"},
+    "branch": {"type": "string", "minLength": 1},
+    "upstream": {"type": ["string", "null"]},
+    "state": {
+      "type": "string",
+      "enum": [
+        "created", "setup_pending", "setup_failed", "ready", "working",
+        "verifying", "pushed", "review_pending", "blocked_external", "blocked",
+        "complete", "cleanup_pending", "cleaned", "failed", "aborted"
+      ]
+    },
+    "head_sha": {"type": ["string", "null"]},
+    "pushed_sha": {"type": ["string", "null"]},
+    "pr_number": {"type": ["integer", "null"]},
+    "review_status": {
+      "type": "string",
+      "enum": ["pending", "approved", "changes_requested", "rate_limited", "blocked", "not_required"]
+    },
+    "checks_status": {
+      "type": "string",
+      "enum": ["pending", "passed", "failed_touched_scope", "failed_unrelated", "skipped_expected", "external_blocked"]
+    },
+    "last_heartbeat": {"type": "string", "format": "date-time"},
+    "blocker": {"type": ["string", "null"]},
+    "backend": {"type": "string", "enum": ["pi", "hax"], "default": "pi"},
+    "runtime": {"type": "string", "enum": ["herdr", "tmux", "wezterm"]},
+    "backend_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {"type": ["string", "null"]},
+        "model": {"type": ["string", "null"]},
+        "effort": {"type": "string", "enum": ["default", "none", "low", "medium", "high", "xhigh", "max"]},
+        "mode": {"type": "string", "enum": ["interactive", "oneshot"]},
+        "auth_source": {"type": ["string", "null"], "enum": ["codex_cli", "hax_managed", null]},
+        "hax_min_version": {"type": ["string", "null"]}
+      }
+    },
+    "backend_capabilities": {"type": "object"},
+    "backend_limitations": {"type": "array", "items": {"type": "string"}},
+    "backend_session_id": {"type": ["string", "null"]},
+    "backend_exit_code": {"type": ["integer", "null"]},
+    "backend_error_code": {"type": ["string", "null"]}
+  }
+}

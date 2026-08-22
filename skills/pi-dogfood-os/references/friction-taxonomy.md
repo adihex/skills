@@ -20,6 +20,90 @@
 | F12 | Dead code / partial wiring shipped (defined-but-never-called views) | P2 | gate | "Green = executed, not just defined; add a golden scenario per new code path." |
 | F13 | Status-dir clutter / stale panes accumulate | P3 | hygiene | "Clean stale markers with dry-run first; rotate the status dir on a schedule." |
 | F14 | Overlapping duplicate dispatch chains on the same artifact set | P2 | concurrency | "Before dispatching, check for a completed run of the same brief; name re-runs explicitly (-round2)." |
+## Hardening taxonomy F15–F24
+
+Each hardening entry is a regression contract with trigger, evidence, prevention, detection, recovery, and scenario.
+
+### F15 — name/ID targeting mismatch
+- **Trigger:** a pane label changes or name lookup returns `agent_not_found`.
+- **Evidence:** manifest `workspace_id`, `tab_id`, and `pane_id`; target lookup result.
+- **Prevention:** use stable IDs from the manifest and resolve one explicit session.
+- **Detection:** reconcile reports `missing_pane` or `target_not_found`.
+- **Recovery:** stop the send, refresh the manifest from the selected session, and require operator review.
+- **Regression:** G4.
+
+### F16 — message typed but not submitted
+- **Trigger:** text is visible in a pane but the worker did not receive it.
+- **Evidence:** separate send and Enter operations plus pane readback hash/acknowledgement.
+- **Prevention:** send literal text, submit Enter separately, then read back.
+- **Detection:** missing acknowledgement is a hard error.
+- **Recovery:** do not retry blindly; preserve the failed send event and retry once after operator review.
+- **Regression:** G5.
+
+### F17 — setup readiness race
+- **Trigger:** a worker launches while setup is queued, failed, or timed out.
+- **Evidence:** setup status, duration, failure output, and absence of `agent start`.
+- **Prevention:** bounded setup barrier before worker launch.
+- **Detection:** setup failure/timeout state and launch audit.
+- **Recovery:** preserve `setup_failed` or `blocked`; repair setup before retry.
+- **Regression:** G2 and G3.
+
+### F18 — idle/done state mismatch
+- **Trigger:** native `idle` is mistaken for completed work.
+- **Evidence:** native state, manifest state, final report, Git/push/review/check evidence.
+- **Prevention:** `idle` is observational only; completion is state-machine gated.
+- **Detection:** native/manifest disagreement during reconcile.
+- **Recovery:** return to `verifying` or `blocked`, never promote from pane text.
+- **Regression:** G6 and G8.
+
+### F19 — dirty worktree reported complete
+- **Trigger:** a worker claims completion with local changes.
+- **Evidence:** `git status --porcelain` and commit SHA.
+- **Prevention:** clean-worktree gate before completion.
+- **Detection:** Git gate returns `DIRTY_WORKTREE`.
+- **Recovery:** keep the worktree; ask the worker to commit or explain changes.
+- **Regression:** G6.
+
+### F20 — CodeRabbit rate-limit misclassification
+- **Trigger:** a rate-limit message is treated as an approved review.
+- **Evidence:** provider response body, review decision, and reply IDs.
+- **Prevention:** classify rate limits as `blocked_external` with bounded retry.
+- **Detection:** rate-limit pattern in review retrieval.
+- **Recovery:** preserve the worktree and wait for operator-authorized retry.
+- **Regression:** G7.
+
+### F21 — teardown process leak
+- **Trigger:** Nx, Git fsmonitor, or worker children remain after cleanup.
+- **Evidence:** PID, exact cwd, process kind, and post-stop inspection.
+- **Prevention:** stop only owned PIDs whose cwd equals the target worktree.
+- **Detection:** cleanup process verification.
+- **Recovery:** leave `cleanup_pending` and report remaining PIDs.
+- **Regression:** G9.
+
+### F22 — duplicate worktree ownership
+- **Trigger:** two active runs claim one worktree.
+- **Evidence:** run IDs and ownership fields in manifests.
+- **Prevention:** refuse cleanup and launch when ownership is ambiguous.
+- **Detection:** reconcile ownership mismatch.
+- **Recovery:** operator selects the owner; no automatic deletion.
+- **Regression:** G4 and G10.
+
+### F23 — cleanup partial deletion
+- **Trigger:** workspace close or worktree removal stops halfway through.
+- **Evidence:** `cleanup_pending` manifest and exact failed command.
+- **Prevention:** transactional order, dry-run default, bounded retries.
+- **Detection:** path/workspace verification after each step.
+- **Recovery:** preserve the manifest and leave the workspace for manual cleanup.
+- **Regression:** G10.
+
+### F24 — memory-pressure dispatch collapse
+- **Trigger:** too many full-repository workers start together.
+- **Evidence:** active/setup counts, memory ratio, wait and retry metrics.
+- **Prevention:** default max four workers, setup concurrency two, staggered launches, and backpressure.
+- **Detection:** deterministic admission refusal codes.
+- **Recovery:** queue work and launch only after capacity returns.
+- **Regression:** G3.
+
 
 ## The four failure classes to pre-empt in every brief
 

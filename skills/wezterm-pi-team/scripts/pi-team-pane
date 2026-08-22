@@ -6,6 +6,7 @@ exit codes 0=ok / 1=usage / 2=runtime-wezterm / 3=safety-refusal. Stdlib only.
 """
 import argparse
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -13,7 +14,16 @@ import subprocess
 import sys
 import urllib.parse
 from collections import Counter
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[3]
+SHARED_PATH = ROOT / "scripts" / "hax_backend.py"
+SHARED_SPEC = importlib.util.spec_from_file_location("shared_hax_backend_wezterm", SHARED_PATH)
+if SHARED_SPEC is None or SHARED_SPEC.loader is None:
+    raise ImportError(f"shared Hax backend is unavailable: {SHARED_PATH}")
+hax_backend = importlib.util.module_from_spec(SHARED_SPEC)
+sys.modules[SHARED_SPEC.name] = hax_backend
+SHARED_SPEC.loader.exec_module(hax_backend)
 VERSION = "0.2.0"
 MODEL_DEFAULT = "opencode/deepseek-v4-flash-free"
 EXTENSION_DEFAULT = "~/.pi/agent/extensions/team.ts"
@@ -35,6 +45,14 @@ def fail(code, message, suggestion=None):
     sys.stderr.write("\n")
     sys.exit(code)
 
+
+def fail_code(exit_code, error_code, message, suggestion=None):
+    err = {"error": True, "code": error_code, "message": message}
+    if suggestion:
+        err["suggestion"] = suggestion
+    json.dump(err, sys.stderr, indent=2)
+    sys.stderr.write("\n")
+    sys.exit(exit_code)
 
 def wz_timeout_sec():
     """Parse WezTerm CLI timeout from env; report bad values as structured errors."""
@@ -68,7 +86,7 @@ class CliParser(argparse.ArgumentParser):
 
 def wz(argv, cwd=None):
     """Run `wezterm cli <argv>`; returns (rc, stdout, stderr). Adds --class if WEZTERM_CLASS is set."""
-    cmd = ["wezterm", "cli"]
+    cmd = [os.environ.get("PI_TEAM_WEZTERM_COMMAND", "wezterm"), "cli"]
     cls = os.environ.get("WEZTERM_CLASS")
     if cls:
         cmd += ["--class", cls]
@@ -175,6 +193,37 @@ def is_pi_pane(pane):
     return bool(pane and (pane.get("title") or "").startswith(TITLE_PREFIX))
 
 
+def backend_for_args(args, saved=None):
+    saved = saved or {}
+    config = {"backend": getattr(args, "backend", None) or saved.get("backend", "pi")}
+    config.update(saved.get("backend_config") or {})
+    for key in ("provider", "model", "effort", "mode", "auth_source", "hax_min_version"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+    try:
+        config = hax_backend.BackendConfig.from_mapping(config)
+    except hax_backend.HaxConfigError as exc:
+        fail_code(2, exc.code, str(exc), "provide a valid explicit backend configuration")
+    return hax_backend.HaxBackend(hax_command=getattr(args, "hax_command", "hax"), codex_command=getattr(args, "codex_command", "codex"), auth_path=getattr(args, "auth_path", None)), config
+
+
+def save_manifest(path, value):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def read_manifest(path):
+    if not path:
+        return {}
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        fail(2, "MANIFEST_UNREADABLE", "manifest is missing or invalid", "create the manifest with launch")
+
+
 def get_pane_text(pid, lines=30):
     """Read recent pane text. Returns (rc, text, err); callers decide whether failure is fatal."""
     return wz(["get-text", "--pane-id", str(pid), "--start-line", "-%d" % int(lines)])
@@ -214,7 +263,48 @@ def fenced_send_submit(pid, text):
     return 0, "sent", ""
 
 
-# ---------------------------------------------------------------------------
+class WeztermHaxTransport:
+    """Thin WezTerm transport; shared HaxBackend owns readiness and lifecycle."""
+
+    def start(self, worker, command):
+        if worker["split"] == "spawn":
+            rc, out, err = wz(["spawn", "--new-window", "--cwd", worker["cwd"], "--"] + command)
+        else:
+            direction = {"right": "--right", "bottom": "--bottom", "left": "--left", "top": "--top"}[worker["split"]]
+            split_args = ["split-pane", "--pane-id", str(worker["host"]), direction, "--cwd", worker["cwd"]]
+            if worker.get("percent") is not None:
+                split_args += ["--percent", str(worker["percent"])]
+            rc, out, err = wz(split_args + ["--"] + command)
+        if rc != 0:
+            raise hax_backend.HaxLifecycleError("LAUNCH_FAILED", err or "WezTerm pane launch failed")
+        try:
+            pane_id = int(out.strip())
+        except ValueError as exc:
+            raise hax_backend.HaxLifecycleError("LAUNCH_INVALID", "WezTerm did not return a pane ID") from exc
+        title = "%s%s - %s" % (TITLE_PREFIX, worker["label"], os.path.basename(worker["cwd"]))
+        return {"pane_id": pane_id, "title": title, "split": worker["split"]}
+
+    def read_state(self, worker):
+        rc, text, err = get_pane_text(worker["pane_id"], lines=20)
+        return {"text": text, "exit_code": rc, "stderr": err}
+
+    def send(self, worker, text):
+        rc, phase, err = fenced_send_submit(worker["pane_id"], text)
+        if rc != 0:
+            raise hax_backend.HaxLifecycleError("HAX_SEND_FAILED", "WezTerm send failed during %s" % phase, details={"stderr": err})
+        return {"paneId": worker["pane_id"], "sent": True, "submitted": True, "fenced": True}
+
+    def interrupt(self, worker):
+        rc, out, err = wz(["send-text", "--pane-id", str(worker["pane_id"]), "--no-paste", "\u0003"])
+        return {"exit_code": rc, "stderr": err}
+
+    def resume(self, worker):
+        raise hax_backend.HaxLifecycleError("HAX_RESUME_UNSUPPORTED", "WezTerm transport cannot prove Hax resume continuity")
+
+    def stop(self, worker):
+        rc, out, err = wz(["kill-pane", "--pane-id", str(worker["pane_id"])])
+        return {"exit_code": rc, "stderr": err[:200]}
+
 # commands
 # ---------------------------------------------------------------------------
 
@@ -240,19 +330,37 @@ def do_launch(args):
     cwd = os.path.abspath(args.cwd or os.getcwd())
     if not os.path.isdir(cwd):
         fail(2, "cwd does not exist: %s" % cwd, "pass --cwd pointing at an existing directory")
+    backend, config = backend_for_args(args)
+    if config.backend == "hax":
+        try:
+            backend.preflight(config)
+        except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
+            fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
+        if config.mode == "oneshot":
+            fail(3, "ONESHOT_DIRECT_REQUIRED", "one-shot Hax runs directly and cannot create a steerable pane", "use launch without a pane or --mode interactive")
     host = current_pane_id()
     if host is None:
         fail(2, "WEZTERM_PANE is not set", "run this from inside a WezTerm pane (or set WEZTERM_PANE)")
     list_panes()  # preflight: reachable mux before we spawn anything
+    if config.backend == "hax":
+        transport = WeztermHaxTransport()
+        context = {"label": args.name, "cwd": cwd, "host": host, "split": args.split, "percent": args.percent}
+        try:
+            started = backend.start(context, config, transport)
+        except (hax_backend.HaxLifecycleError, hax_backend.HaxPreflightError) as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        pane_id = int(started["pane_id"])
+        return pane_id, started["split"], started["title"], " ".join(home_display(str(value)) for value in backend.build_command(config)), config
+
 
     ext = os.path.expanduser(args.extension or EXTENSION_DEFAULT)
-    model = args.model or MODEL_DEFAULT
-    pi_prog = ["pi", "-e", ext, "--model", model, "--name", args.name, "@" + brief_file]
+    model = getattr(args, "model", None) or MODEL_DEFAULT
+    worker_prog = ["pi", "-e", ext, "--model", model, "--name", args.name, "@" + brief_file]
     if args.split == "spawn":
         if args.percent is not None:
             fail(1, "--percent only applies to split panes",
                  "use --split right|bottom|left|top for a percent-sized split, or drop --percent")
-        rc, out, err = wz(["spawn", "--new-window", "--cwd", cwd, "--"] + pi_prog)
+        rc, out, err = wz(["spawn", "--new-window", "--cwd", cwd, "--"] + worker_prog)
         split = "spawn"
     else:
         direction = {"right": "--right", "bottom": "--bottom",
@@ -260,7 +368,7 @@ def do_launch(args):
         split_args = ["split-pane", "--pane-id", str(host), direction, "--cwd", cwd]
         if args.percent is not None:
             split_args += ["--percent", str(args.percent)]
-        rc, out, err = wz(split_args + ["--"] + pi_prog)
+        rc, out, err = wz(split_args + ["--"] + worker_prog)
         split = args.split
     if rc != 0:
         fail(2, "wezterm %s failed: %s" % (split, err), "check wezterm state; nothing was spawned")
@@ -269,17 +377,60 @@ def do_launch(args):
     except ValueError:
         fail(2, "wezterm %s did not return a pane id (got %r)" % (split, out), "check wezterm version")
     title = "%s%s - %s" % (TITLE_PREFIX, args.name, os.path.basename(cwd))
-    pi_cmd = " ".join(["pi", "-e", home_display(ext), "--model", model, "--name", args.name, "@" + home_display(brief_file)])
-    return new_pid, split, title, pi_cmd
+    command_display = " ".join(home_display(str(value)) for value in worker_prog)
+    return new_pid, split, title, command_display, config
+
+
 
 
 def cmd_launch(args):
-    pid, split, title, pi_cmd = do_launch(args)
-    emit({"paneId": pid, "split": split, "cwd": os.path.abspath(args.cwd or os.getcwd()),
-          "title": title, "piCommand": pi_cmd})
-
+    backend, requested = backend_for_args(args)
+    if requested.backend == "hax" and requested.mode == "oneshot":
+        brief_file = os.path.abspath(args.brief_file)
+        if not os.path.isfile(brief_file) or not os.access(brief_file, os.R_OK):
+            fail(2, "brief file not readable: %s" % brief_file, "create the brief file first, then retry")
+        try:
+            result = backend.run_oneshot(requested, prompt=Path(brief_file).read_text(encoding="utf-8"), cwd=args.cwd)
+        except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
+            fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
+        manifest = {"run_id": "wezterm-direct-oneshot", "label": args.name, "workspace_id": "direct-oneshot", "tab_id": "direct-oneshot", "pane_id": "direct-oneshot",
+                    "cwd": os.path.abspath(args.cwd), "worktree": os.path.abspath(args.cwd), "branch": "unknown", "state": result["state"],
+                    "blocker": result.get("code") if result["state"] != "verifying" else None, "backend_exit_code": result.get("exit_code"),
+                    **requested.manifest_fields(runtime="wezterm")}
+        path = args.manifest or os.path.join("/tmp", "team-task", "manifests", args.name + ".json")
+        save_manifest(path, manifest)
+        emit({**manifest, "manifest_path": path, "stdout": result["stdout"], "stderr": result["stderr"], "command": result["command"]})
+        return
+    try:
+        pid, split, title, command_display, config = do_launch(args)
+    except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
+        fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
+    readiness = {"ready": True, "code": "interactive_prompt"} if config.backend == "hax" else None
+    submission = None
+    if config.backend == "hax":
+        try:
+            submission = backend.send({"pane_id": pid, "runtime": "wezterm"}, Path(args.brief_file).read_text(encoding="utf-8"), WeztermHaxTransport())
+        except hax_backend.HaxLifecycleError as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+    manifest = {"run_id": "wezterm-%s" % pid, "label": args.name, "workspace_id": "wezterm", "tab_id": "wezterm", "pane_id": pid,
+                "cwd": os.path.abspath(args.cwd or os.getcwd()), "worktree": os.path.abspath(args.cwd or os.getcwd()), "branch": "unknown",
+                "state": "working" if config.backend == "hax" else "ready", "blocker": None, **config.manifest_fields(runtime="wezterm")}
+    if readiness:
+        manifest.update({"hax_readiness": readiness, "hax_submission": submission})
+    path = args.manifest or os.path.join("/tmp", "team-task", "manifests", args.name + ".json")
+    save_manifest(path, manifest)
+    emit({**manifest, "manifest_path": path, "title": title, "command": command_display, "split": split})
 
 def cmd_send(args):
+    saved = read_manifest(args.manifest)
+    backend, config = backend_for_args(args, saved)
+    if config.backend == "hax":
+        try:
+            backend.preflight(config)
+        except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
+            fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
+        if config.mode != "interactive":
+            fail(3, "BACKEND_NOT_STEERABLE", "one-shot Hax workers cannot receive pane messages", "launch with --mode interactive")
     panes, cur = list_panes()
     pid = args.pane_id
     pane = find_pane(panes, pid)
@@ -302,10 +453,17 @@ def cmd_send(args):
              "wait for an idle prompt, omit --require-idle, or pass --force for a deliberate override")
 
     text = args.text
-    rc, phase, err = fenced_send_submit(pid, text)
-    if rc != 0:
-        fail(2, "send-text to pane %s failed during %s: %s" % (pid, phase, err), "check wezterm state")
-    emit({"paneId": pid, "sent": True, "chars": len(text), "cliState": cli_state, "fenced": True})  # never echo text
+    if config.backend == "hax":
+        try:
+            submission = backend.send({"pane_id": pid, "runtime": "wezterm"}, text, WeztermHaxTransport())
+        except hax_backend.HaxLifecycleError as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        emit(submission | {"backend": "hax", "cliState": cli_state})
+    else:
+        rc, phase, err = fenced_send_submit(pid, text)
+        if rc != 0:
+            fail(2, "send-text to pane %s failed during %s: %s" % (pid, phase, err), "check wezterm state")
+        emit({"paneId": pid, "sent": True, "chars": len(text), "cliState": cli_state, "fenced": True, "backend": "pi"})  # never echo text
 
 
 def cmd_focus(args):
@@ -354,6 +512,7 @@ def cmd_status_tail(panes, args):
 
 def cmd_status(args):
     panes, cur = list_panes()  # preflight + live join data
+    saved = read_manifest(args.manifest)
     if args.tail is not None:
         cmd_status_tail(panes, args)
         return
@@ -367,7 +526,11 @@ def cmd_status(args):
         candidates = sorted(glob.glob(os.path.join(root, "dispatch-*")),
                             key=lambda d: os.path.getmtime(d), reverse=True)
         if not candidates:
-            emit({"root": root, "dir": None, "dispatch": None, "workers": []})
+            backend_name = saved.get("backend", "pi")
+            mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+            emit({"root": root, "dir": None, "dispatch": None, "runtime": "wezterm", "backend": backend_name,
+                  "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm"),
+                  "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode), "workers": []})
             return
         dispatch_dir = candidates[0]
 
@@ -396,16 +559,24 @@ def cmd_status(args):
     workers, matched = [], []
     for label in sorted(by_label):
         rec = by_label[label]
+        backend_name = rec.get("backend", "pi")
+        mode = (rec.get("backend_config") or {}).get("mode", "interactive")
+        capabilities = rec.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm")
+        limitations = rec.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode)
         w = {"label": label, "status": rec.get("status"), "activity": rec.get("activity"),
-             "turn": rec.get("turn"), "updatedAt": rec.get("updatedAt"),
-             "source": rec.get("source"), "paneId": None}
+             "turn": rec.get("turn"), "updatedAt": rec.get("updatedAt"), "source": rec.get("source"), "paneId": None,
+             "backend": backend_name, "runtime": rec.get("runtime", "wezterm"), "backend_capabilities": capabilities,
+             "backend_limitations": limitations}
         p = pane_by_label.get(label)
         if p is not None:
             w["paneId"] = p["paneId"]
             matched.append({"paneId": p["paneId"], "title": p["title"], "label": label})
         workers.append(w)
-
-    payload = {"root": root, "dir": dispatch_dir, "dispatch": dispatch,
+    backend_name = saved.get("backend", "pi")
+    mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+    payload = {"root": root, "dir": dispatch_dir, "dispatch": dispatch, "backend": backend_name, "runtime": "wezterm",
+               "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm"),
+               "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode),
                "workers": workers, "panes": matched}
     if args.human:
         lines = ["root:    %s" % payload["root"]]
@@ -431,9 +602,26 @@ def cmd_status(args):
 
 
 def cmd_cleanup(args):
+    if args.manifest:
+        saved = read_manifest(args.manifest)
+        backend, config = backend_for_args(args, saved)
+        if config.backend == "hax":
+            pane_id = int(saved.get("pane_id") or saved.get("paneId") or 0)
+            payload = {"runtime": "wezterm", "backend": "hax", "dryRun": not args.confirm or args.dry_run, "pane_id": pane_id, "action": "plan"}
+            if payload["dryRun"]:
+                emit(payload)
+                return
+            try:
+                shutdown = backend.stop({"pane_id": pane_id, "runtime": "wezterm"}, WeztermHaxTransport())
+            except hax_backend.HaxLifecycleError as exc:
+                fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+            saved["backend_shutdown"] = shutdown
+            save_manifest(args.manifest, saved)
+            emit({**payload, "action": "stopped", "shutdown": shutdown})
+            return
     pattern = args.pattern
     if not pattern:
-        fail(1, "cleanup requires --pattern", "e.g. --pattern 'proto-|team-'")
+        fail(1, "cleanup requires --pattern or an Hax --manifest", "choose an explicit target")
     try:
         rx = re.compile(pattern)
     except re.error as e:
@@ -515,16 +703,48 @@ def cmd_cleanup(args):
         fail(3, "cleanup refused: every matched pane is protected",
              "pane 0 / current pane / last pane in window can never be killed by cleanup")
 
+def cmd_doctor(args):
+    backend, config = backend_for_args(args)
+    payload = {"backend": config.backend, "runtime": "wezterm", "capabilities": backend.capabilities(config, runtime="wezterm")}
+    if config.backend == "hax":
+        payload["diagnostics"] = backend.diagnostics(config, runtime="wezterm")
+    else:
+        payload["default"] = True
+    emit(payload)
+
+
+def delegate_lifecycle(args):
+    cli = ROOT / "skills" / "herdr-pi-team" / "scripts" / "pi-team-herdr"
+    if args.command == "complete":
+        command = [sys.executable, str(cli), "--git-command", args.git_command, "--gh-command", args.gh_command, "complete", "--manifest", args.manifest, "--report", args.report, "--repository", args.repository]
+        if args.pr is not None:
+            command += ["--pr", str(args.pr)]
+    else:
+        command = [sys.executable, str(cli), "--git-command", args.git_command, "--gh-command", args.gh_command, "reconcile", "--run", args.run_id, "--manifest-dir", args.manifest_dir]
+        if args.report:
+            command += ["--report", args.report]
+    result = subprocess.run(command, capture_output=True, text=True, shell=False)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    raise SystemExit(result.returncode)
 
 def cmd_launch_dispatch(args):
-    pid, split, title, pi_cmd = do_launch(args)
+    backend, _ = backend_for_args(args)
+    pid, split, title, pi_cmd, config = do_launch(args)
     text = args.dispatch_instruction
+    if config.backend == "hax":
+        try:
+            backend.send({"pane_id": pid, "runtime": "wezterm"}, text, WeztermHaxTransport())
+        except hax_backend.HaxLifecycleError as exc:
+            fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True, "backend": "hax"})
+        return
     rc, phase, err = fenced_send_submit(pid, text)
     if rc != 0:
-        fail(2, "launch succeeded but dispatch send failed during %s: %s" % (phase, err),
-             "worker pane %s is live; resend with: pi-team-pane send --pane-id %s --text '<instruction>'"
-             % (pid, pid))
-    emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True})
+        fail(2, "launch succeeded but dispatch send failed during %s: %s" % (phase, err), "worker pane is live; resend with pi-team-pane send")
+    emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True, "backend": "pi"})
 
 
 # ---------------------------------------------------------------------------
@@ -550,12 +770,28 @@ def brief_payload():
              "summary": "team worker status from dispatch dirs, or tail a pane's recent text"},
             {"command": "focus --pane-id <id> [--force]",
              "summary": "bring a pane to the foreground; refuses pane 0/current unless forced"},
+            {"command": "complete --manifest <file> --report <file> --repository <owner/repo>",
+             "summary": "delegate the common Git/review/check completion gate"},
+            {"command": "doctor --backend hax --provider codex --model <model>",
+             "summary": "show safe Hax capability diagnostics"},
             {"command": "cleanup --pattern <regex> [--confirm]",
-             "summary": "dry-run by default; kill stale panes only with --confirm"},
+             "summary": "dry-run by default; kill stale team panes only with protection rules"},
             {"command": "launch-and-dispatch --name <n> --brief-file <p> --dispatch-instruction <t>",
-             "summary": "launch a worker then send its dispatch instruction"},
+             "summary": "launch a worker then send its dispatch instruction"}
         ],
     }
+
+def add_backend_args(parser):
+    parser.add_argument("--backend", choices=["pi", "hax"], default=argparse.SUPPRESS, help="backend (Pi is the default; Hax is explicit opt-in)")
+    parser.add_argument("--provider", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--model", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--effort", choices=["default", "none", "low", "medium", "high", "xhigh", "max"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--mode", choices=["interactive", "oneshot"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--auth-source", dest="auth_source", choices=["codex_cli", "hax_managed"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--hax-min-version", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--hax-command", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--codex-command", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--auth-path", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
 
 def build_parser():
@@ -579,9 +815,9 @@ def build_parser():
     p_launch.add_argument("--percent", type=percent_int, default=None,
                           help="split size as a percentage of available space (10..90; split panes only)")
     p_launch.add_argument("--cwd", default=os.getcwd(), help="working directory for the worker (default: current dir)")
-    p_launch.add_argument("--model", default=MODEL_DEFAULT, help="pi model (default: %(default)s)")
     p_launch.add_argument("--extension", default=EXTENSION_DEFAULT, help="pi extension (default: %(default)s)")
-
+    p_launch.add_argument("--manifest", default=None, help="manifest path (auto-created when omitted)")
+    add_backend_args(p_launch)
     p_send = sub.add_parser("send", help="fenced send+Enter to a pi pane")
     p_send.add_argument("--pane-id", type=int, required=True, help="target pane id")
     p_send.add_argument("--text", required=True, help="text to send (never echoed)")
@@ -589,7 +825,8 @@ def build_parser():
                         help="refuse unless recent pane text looks idle/ready")
     p_send.add_argument("--force", action="store_true",
                         help="override protected/current/non-pi/require-idle refusals deliberately")
-
+    p_send.add_argument("--manifest", default=None, help="worker manifest for backend-aware steering")
+    add_backend_args(p_send)
     p_focus = sub.add_parser("focus", help="bring a pane to the foreground")
     p_focus.add_argument("--pane-id", type=int, required=True, help="target pane id")
     p_focus.add_argument("--force", action="store_true",
@@ -603,14 +840,17 @@ def build_parser():
     p_status.add_argument("--lines", type=int, default=30,
                           help="tail line count (capped at 200; default: 30)")
     p_status.add_argument("--human", action="store_true", help="human-readable summary")
+    p_status.add_argument("--manifest", default=None, help="worker manifest for backend-aware status")
 
     p_cleanup = sub.add_parser("cleanup", help="clean stale panes by title regex (dry-run by default)")
-    p_cleanup.add_argument("--pattern", required=True, help="regex matched against pane title/label")
+    p_cleanup.add_argument("--pattern", default=None, help="regex matched against pane title/label")
+    p_cleanup.add_argument("--manifest", default=None, help="exact backend-owned worker manifest")
     p_cleanup.add_argument("--dry-run", action="store_true", help="explicit dry run (default mode)")
     p_cleanup.add_argument("--confirm", action="store_true", help="actually kill matched panes")
     p_cleanup.add_argument("--force", action="store_true",
                            help="allow matching non-pi panes; pane 0/current/last-pane protection remains absolute")
     p_cleanup.add_argument("--human", action="store_true", help="human-readable listing")
+    add_backend_args(p_cleanup)
 
     p_lad = sub.add_parser("launch-and-dispatch", help="launch a named pi agent, then send its dispatch instruction")
     p_lad.add_argument("--name", required=True, help="worker label")
@@ -620,8 +860,26 @@ def build_parser():
     p_lad.add_argument("--percent", type=percent_int, default=None,
                        help="split size as a percentage of available space (10..90; split panes only)")
     p_lad.add_argument("--cwd", default=os.getcwd())
-    p_lad.add_argument("--model", default=MODEL_DEFAULT)
+    add_backend_args(p_lad)
     p_lad.add_argument("--extension", default=EXTENSION_DEFAULT)
+
+    p_doctor = sub.add_parser("doctor", help="show backend capability and prerequisite diagnostics")
+    add_backend_args(p_doctor)
+
+    p_complete = sub.add_parser("complete", help="delegate common Git/review/check completion gate")
+    p_complete.add_argument("--manifest", required=True)
+    p_complete.add_argument("--report", required=True)
+    p_complete.add_argument("--repository", required=True)
+    p_complete.add_argument("--pr", type=int, default=None)
+    p_complete.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
+    p_complete.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
+
+    p_reconcile = sub.add_parser("reconcile", help="delegate common manifest reconciliation")
+    p_reconcile.add_argument("--run", dest="run_id", required=True)
+    p_reconcile.add_argument("--manifest-dir", required=True)
+    p_reconcile.add_argument("--report", default=None)
+    p_reconcile.add_argument("--git-command", default="git", help=argparse.SUPPRESS)
+    p_reconcile.add_argument("--gh-command", default="gh", help=argparse.SUPPRESS)
     return parser
 
 
@@ -634,8 +892,11 @@ def main(argv):
     if getattr(args, "brief", False) or not getattr(args, "command", None):
         emit(brief_payload())  # bare invocation == --brief
         return 0
+    if args.command in {"complete", "reconcile"}:
+        delegate_lifecycle(args)
+        return 0
     {"list": cmd_list, "launch": cmd_launch, "send": cmd_send, "status": cmd_status,
-     "focus": cmd_focus, "cleanup": cmd_cleanup, "launch-and-dispatch": cmd_launch_dispatch}[args.command](args)
+     "doctor": cmd_doctor, "focus": cmd_focus, "cleanup": cmd_cleanup, "launch-and-dispatch": cmd_launch_dispatch}[args.command](args)
     return 0
 
 
