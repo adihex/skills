@@ -1,6 +1,6 @@
 ---
 name: herdr-pi-team
-description: Use when launching, steering, monitoring, resuming, or safely cleaning up named pi agents in Herdr panes.
+description: Use when you need to launch, steer, monitor, resume, or safely clean up named pi agents in Herdr panes; provides live preflight, native-state verification, and same-worktree recovery guidance for setup, integration, and configuration failures.
 license: MIT
 compatibility: [herdr, pi]
 risk: destructive-operations-gated
@@ -103,7 +103,7 @@ To move an idle worker, preserve its worktree, close the old pane, start `pi --c
 | `cleanup --pattern RX [--confirm] [--force]` | Dry-run by default; closes matched panes |
 
 ## Safe recipes
-- Launch: `pi-team-herdr launch --name tests --brief-file /tmp/brief.md`.
+- Launch: `pi-team-herdr launch --name tests --brief-file docs/brief.md`.
 - Dedicated space: first verify the wrapper supports the workspace path; otherwise use native Herdr start in an existing pane.
 - Send: prefer nonblocking `herdr agent prompt NAME TEXT`; use `--wait` only when the timeout and expected completion state are appropriate.
 - Inspect: `herdr agent list` and `herdr agent read NAME --lines 50`.
