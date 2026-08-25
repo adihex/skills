@@ -1,6 +1,6 @@
 ---
 name: herdr-pi-team
-description: Use when you need to launch, steer, monitor, resume, or safely clean up named pi agents in Herdr panes; provides live preflight, native-state verification, and same-worktree recovery guidance for setup, integration, and configuration failures.
+description: Use when you need to run and manage named pi agents in Herdr panes; use this when launching, steering, monitoring, resuming, or safely cleaning up workers, especially after setup, integration, or configuration failures.
 license: MIT
 compatibility: [herdr, pi]
 risk: destructive-operations-gated
