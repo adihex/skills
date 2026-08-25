@@ -38,6 +38,9 @@ The current verified interface is Herdr `0.8.2`, `pi-team-herdr 0.2.0`, Pi integ
 
 Check for duplicated skill copies before launching. A work-profile copy alongside canonical `~/.agents/skills` can produce skill-collision warnings; use the canonical skill via symlink and do not edit installed/generated copies. Confirm the source with `realpath` and repository status.
 
+## Backend and completion boundaries
+Pi is the default native backend. If the installed wrapper exposes `--backend hax`, opt into it explicitly and run its backend-specific doctor; never silently fall back between backends. Keep the wrapper's manifest, reconciliation, review, checks, and cleanup gates when using backend modes. Native Herdr state `idle` means available, not complete; completion still requires the applicable artifact, Git, review, and check evidence.
+
 ## One-session and one-worktree rules
 - Use the same session everywhere: bare `herdr` + bare `pi-team-herdr`, or `herdr --session NAME` + `pi-team-herdr --session NAME`.
 - Treat a worktree as the worker's durable identity. Never reuse a worktree concurrently for another writer.
