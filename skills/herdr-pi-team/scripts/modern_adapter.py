@@ -85,19 +85,41 @@ class ModernHerdrAdapter:
     def list_workers(self) -> list[dict]:
         return self._agents(self._json(["agent", "list"], "agent list"))
 
+    @staticmethod
+    def _validate_pi_worker(worker: dict, name: str) -> dict:
+        if str(worker.get("agent") or worker.get("kind") or "").lower() != "pi":
+            raise ModernAdapterError("NOT_PI_AGENT", "target is not a Pi agent", details={"name": name}, safety=True)
+        return worker
+
+    def get_worker(self, name: str) -> dict:
+        current = self._json(["agent", "get", name], "agent get")
+        current = current["agent"] if isinstance(current.get("agent"), dict) else current
+        return self._validate_pi_worker(current, name)
+
     def resolve_worker(self, name: str) -> dict:
         rows = [row for row in self.list_workers() if str(row.get("name") or row.get("agent") or "") == name]
         if len(rows) != 1:
             raise ModernAdapterError("WORKER_NAME_AMBIGUOUS", "worker name must resolve to exactly one agent", details={"name": name, "matches": len(rows)}, safety=True)
-        worker = rows[0]
-        if str(worker.get("agent") or worker.get("kind") or "").lower() != "pi":
-            raise ModernAdapterError("NOT_PI_AGENT", "target is not a Pi agent", details={"name": name}, safety=True)
+        self._validate_pi_worker(rows[0], name)
         # Get refreshes the registry result and proves target addressing works.
-        current = self._json(["agent", "get", name], "agent get")
-        current = current["agent"] if isinstance(current.get("agent"), dict) else current
-        if str(current.get("agent") or current.get("kind") or "").lower() != "pi":
-            raise ModernAdapterError("NOT_PI_AGENT", "target is not a Pi agent", details={"name": name}, safety=True)
-        return current
+        return self.get_worker(name)
+
+    def observe_registered_workers(self, registrations: list[dict]) -> list[tuple[dict, dict]]:
+        """Resolve one registry snapshot against mailbox-owned stable identities."""
+        rows = self.list_workers()
+        observed = []
+        for registration in registrations:
+            name = str(registration.get("name") or "")
+            matches = [row for row in rows if str(row.get("name") or "") == name]
+            if len(matches) != 1:
+                raise ModernAdapterError("WORKER_NAME_AMBIGUOUS", "registered worker must resolve to exactly one agent", details={"name": name, "matches": len(matches)}, safety=True)
+            worker = self._validate_pi_worker(matches[0], name)
+            actual_workspace = str(worker.get("workspace_id") or "")
+            actual_pane = str(worker.get("pane_id") or "")
+            if actual_workspace != str(registration.get("workspace_id")) or actual_pane != str(registration.get("pane_id")):
+                raise ModernAdapterError("WORKER_IDENTITY_CONFLICT", "registered worker identity changed", details={"name": name, "expectedWorkspaceId": registration.get("workspace_id"), "actualWorkspaceId": actual_workspace, "expectedPaneId": registration.get("pane_id"), "actualPaneId": actual_pane}, safety=True)
+            observed.append((registration, worker))
+        return observed
 
     @staticmethod
     def read_prompt(path: str) -> str:

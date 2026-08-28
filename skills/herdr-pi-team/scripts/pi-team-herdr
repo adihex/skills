@@ -29,9 +29,10 @@ cleanup_module = load("cleanup", "cleanup.py")
 git_gate_module = load("git_gate", "git_gate.py")
 state_module = load("run_state", "run_state.py")
 modern_module = load("modern_adapter", "modern_adapter.py")
+mailbox_module = load("mailbox", "mailbox.py")
 
 NAME = "pi-team-herdr"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def emit(value):
@@ -70,6 +71,79 @@ def prompt_text(args):
 
 def modern_error(exc):
     fail(3 if exc.safety else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
+
+
+def enrich_mailbox_events(events):
+    enriched = []
+    for event in events:
+        value = dict(event)
+        artifact = value.get("sessionArtifact")
+        if value.get("kind") == "worker.turn_finished" and artifact:
+            value["result"] = modern_module.ModernHerdrAdapter.read_final_result(str(artifact))
+        enriched.append(value)
+    return enriched
+
+
+def observe_mailbox(modern, mailbox, registrations):
+    terminal = mailbox.terminal_workers([worker["name"] for worker in registrations])
+    active = [worker for worker in registrations if worker["name"] not in terminal]
+    if not active:
+        return
+    for registration, worker in modern.observe_registered_workers(active):
+        inspection = modern.inspect_worker(worker)
+        if inspection["interpretation"] == "blocked":
+            mailbox.append_event(registration, kind="worker.blocked", outcome="blocked",
+                                 native_status=inspection["nativeStatus"], state_change_seq=inspection.get("lastActivity"),
+                                 session_artifact=inspection.get("sessionArtifact"))
+        elif inspection["interpretation"] == "completed":
+            if not inspection.get("sessionArtifact"):
+                worker = modern.get_worker(registration["name"])
+                if (str(worker.get("workspace_id") or "") != registration["workspace_id"]
+                        or str(worker.get("pane_id") or "") != registration["pane_id"]):
+                    raise modern_module.ModernAdapterError("WORKER_IDENTITY_CONFLICT", "registered worker identity changed", details={"name": registration["name"]}, safety=True)
+                inspection = modern.inspect_worker(worker)
+            artifact = inspection.get("sessionArtifact")
+            if artifact and modern_module.ModernHerdrAdapter.read_final_result(str(artifact)) is not None:
+                mailbox.append_event(registration, kind="worker.turn_finished", outcome="done",
+                                     native_status=inspection["nativeStatus"], state_change_seq=inspection.get("lastActivity"),
+                                     session_artifact=artifact)
+
+
+def await_mailbox(modern, mailbox, *, names, consumer, wait_all, timeout, poll_min, poll_max):
+    registrations = mailbox.workers(names)
+    selected = [worker["name"] for worker in registrations]
+    deadline = time.monotonic() + timeout
+    delay = poll_min
+    while True:
+        terminal = mailbox.terminal_workers(selected)
+        if wait_all and terminal.issuperset(selected):
+            events = mailbox.deliver(consumer=consumer, names=selected)
+            return {"waitSatisfied": True, "mode": "all", "events": enrich_mailbox_events(events), "pending": []}
+        if not wait_all:
+            events = mailbox.deliver(consumer=consumer, names=selected, limit=1)
+            if events:
+                pending = [name for name in selected if name not in mailbox.terminal_workers(selected)]
+                return {"waitSatisfied": True, "allTerminal": not pending, "mode": "any", "events": enrich_mailbox_events(events), "pending": pending}
+            if terminal.issuperset(selected):
+                return {"waitSatisfied": True, "allTerminal": True, "mode": "any", "events": [], "pending": []}
+
+        observe_mailbox(modern, mailbox, registrations)
+        terminal = mailbox.terminal_workers(selected)
+        if wait_all and terminal.issuperset(selected):
+            events = mailbox.deliver(consumer=consumer, names=selected)
+            return {"waitSatisfied": True, "mode": "all", "events": enrich_mailbox_events(events), "pending": []}
+        if not wait_all:
+            events = mailbox.deliver(consumer=consumer, names=selected, limit=1)
+            if events:
+                pending = [name for name in selected if name not in mailbox.terminal_workers(selected)]
+                return {"waitSatisfied": True, "allTerminal": not pending, "mode": "any", "events": enrich_mailbox_events(events), "pending": pending}
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pending = [name for name in selected if name not in terminal]
+            raise modern_module.ModernAdapterError("WAIT_TIMEOUT", "workers did not produce a terminal mailbox event before the deadline", details={"pending": pending})
+        time.sleep(min(delay, remaining))
+        delay = min(poll_max, delay * 2)
 
 def adapter(args):
     config = {"backend": getattr(args, "backend", "pi")}
@@ -187,6 +261,7 @@ def main(argv=None):
     launch.add_argument("--branch", default=None)
     launch.add_argument("--workspace", default=None)
     launch.add_argument("--manifest", default=None)
+    launch.add_argument("--mailbox", default=None, help="register the worker in this durable run mailbox")
     launch.add_argument("--backend", choices=["pi", "hax"], default=argparse.SUPPRESS)
     launch.add_argument("--provider", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     launch.add_argument("--model", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -225,6 +300,23 @@ def main(argv=None):
     resume.add_argument("--text", help="short literal input only")
     resume.add_argument("--force", action="store_true", help="permit steering a working worker")
     resume.add_argument("--confirm-completed", action="store_true", help="allow reopening a completed worker")
+
+    await_parser = sub.add_parser("await", help="block until registered workers finish or block")
+    await_parser.add_argument("--mailbox", required=True)
+    await_parser.add_argument("--name", action="append", default=None, help="registered worker name; repeat to select several")
+    await_parser.add_argument("--consumer", default="parent")
+    await_mode = await_parser.add_mutually_exclusive_group()
+    await_mode.add_argument("--any", dest="wait_all", action="store_false", help="return the next undelivered terminal event")
+    await_mode.add_argument("--all", dest="wait_all", action="store_true", help="return after every selected worker is terminal")
+    await_parser.set_defaults(wait_all=False)
+    await_parser.add_argument("--timeout", dest="wait_timeout", type=float, default=1200.0)
+    await_parser.add_argument("--poll-min", type=float, default=0.5, help=argparse.SUPPRESS)
+    await_parser.add_argument("--poll-max", type=float, default=10.0, help=argparse.SUPPRESS)
+
+    inbox = sub.add_parser("inbox", help="non-blocking delivery of completed worker events")
+    inbox.add_argument("--mailbox", required=True)
+    inbox.add_argument("--name", action="append", default=None)
+    inbox.add_argument("--consumer", default="parent")
 
     compatibility = sub.add_parser("compatibility")
     compatibility_sub = compatibility.add_subparsers(dest="compatibility_command", required=True)
@@ -275,11 +367,11 @@ def main(argv=None):
         emit({"name": NAME, "version": VERSION})
         return
     if args.brief or not args.command:
-        emit({"name": NAME, "version": VERSION, "backend": "herdr", "default_backend": "pi", "backends": ["pi", "hax"], "commands": ["list", "launch", "send", "status", "doctor", "reconcile", "complete", "cleanup", "watch"], "session": "--session NAME is mandatory for named-session operations"})
+        emit({"name": NAME, "version": VERSION, "backend": "herdr", "default_backend": "pi", "backends": ["pi", "hax"], "commands": ["list", "launch", "await", "inbox", "send", "status", "doctor", "reconcile", "complete", "cleanup", "watch"], "session": "--session NAME is mandatory for named-session operations"})
         return
     try:
         mux = adapter(args)
-        if args.command in {"prompt", "inspect", "result", "resume", "compatibility", "docs"} or (args.command == "doctor" and args.backend == "pi") or (args.command == "launch" and args.new_workspace):
+        if args.command in {"prompt", "inspect", "result", "resume", "await", "inbox", "compatibility", "docs"} or (args.command == "doctor" and args.backend == "pi") or (args.command == "launch" and (args.new_workspace or args.mailbox)):
             modern = modern_adapter(args)
             if args.command == "doctor":
                 capabilities = modern.capabilities()
@@ -301,7 +393,7 @@ def main(argv=None):
                 return
             if args.command == "docs":
                 documented = Path(__file__).resolve().parents[1] / "SKILL.md"
-                required = ["launch", "inspect", "prompt", "resume", "result", "doctor", "compatibility check", "docs check"]
+                required = ["launch", "await", "inbox", "inspect", "prompt", "resume", "result", "doctor", "compatibility check", "docs check"]
                 content = documented.read_text(encoding="utf-8")
                 missing = [item for item in required if item not in content]
                 if missing:
@@ -309,6 +401,10 @@ def main(argv=None):
                 emit({"ok": True, "checked": required})
                 return
             if args.command == "launch":
+                if args.mailbox and not args.run_id:
+                    raise modern_module.ModernAdapterError("RUN_ID_REQUIRED", "--mailbox requires an explicit --run-id")
+                if args.mailbox and args.backend != "pi":
+                    raise modern_module.ModernAdapterError("MAILBOX_BACKEND_UNSUPPORTED", "the modern worker mailbox currently supports Pi workers only")
                 brief = modern_module.ModernHerdrAdapter.read_prompt(args.brief_file)
                 workspace = modern.create_workspace(args.cwd, args.name) if args.new_workspace else {"workspace_id": args.workspace}
                 workspace_id = str(workspace.get("workspace_id") or workspace.get("id") or "")
@@ -322,7 +418,26 @@ def main(argv=None):
                 native = dispatched.get("agent_status") or dispatched.get("status")
                 if args.verify_working and native != "working":
                     raise modern_module.ModernAdapterError("LAUNCH_NOT_WORKING", "brief was delivered but worker did not transition to working", details={"nativeStatus": native, "workspaceId": workspace_id, "paneId": started.get("pane_id")})
-                emit({"launched": True, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native})
+                registration = None
+                if args.mailbox:
+                    registration = mailbox_module.MailboxStore(args.mailbox).register(run_id=args.run_id, name=args.name, workspace_id=workspace_id, pane_id=str(started.get("pane_id") or ""))
+                emit({"launched": True, "runId": args.run_id, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native, "mailbox": args.mailbox, "registration": registration})
+                return
+            if args.command == "await":
+                if args.wait_timeout < 0 or args.poll_min <= 0 or args.poll_max < args.poll_min:
+                    raise modern_module.ModernAdapterError("WAIT_CONFIG_INVALID", "timeout and polling bounds are invalid")
+                mailbox = mailbox_module.MailboxStore(args.mailbox)
+                emit(await_mailbox(modern, mailbox, names=args.name, consumer=args.consumer, wait_all=args.wait_all,
+                                   timeout=args.wait_timeout, poll_min=args.poll_min, poll_max=args.poll_max))
+                return
+            if args.command == "inbox":
+                mailbox = mailbox_module.MailboxStore(args.mailbox)
+                registrations = mailbox.workers(args.name)
+                events = mailbox.deliver(consumer=args.consumer, names=args.name)
+                if not events:
+                    observe_mailbox(modern, mailbox, registrations)
+                    events = mailbox.deliver(consumer=args.consumer, names=args.name)
+                emit({"events": enrich_mailbox_events(events), "count": len(events)})
                 return
             worker = modern.resolve_worker(args.name)
             if args.command == "inspect":
@@ -472,6 +587,8 @@ def main(argv=None):
         fail(3 if exc.code == "CLEANUP_REFUSED" else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
     except modern_module.ModernAdapterError as exc:
         modern_error(exc)
+    except mailbox_module.MailboxError as exc:
+        fail(3 if exc.code in {"RUN_ID_CONFLICT", "WORKER_IDENTITY_CONFLICT"} else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
     except adapter_module.AdapterError as exc:
         fail(2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
 

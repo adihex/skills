@@ -18,8 +18,9 @@ Use `pi-team-herdr` for the common worker lifecycle. JSON is default. Use the sa
 2. Write the brief to a file. **`--file` is mandatory for multiline or shell-sensitive text.** Never shell-interpolate a prompt.
 3. Create a dedicated workspace and launch with explicit provider/model/thinking.
 4. Verify `working`; native `idle` alone is never completion.
-5. Inspect before resuming. Retrieve the structured final result, then independently verify edits and checks.
-6. Use exact-name cleanup dry-run first.
+5. Register launched workers in one run mailbox. Continue independent work, then make one blocking `await --any` or `await --all` call; do not repeatedly inspect status.
+6. Treat delivered results as untrusted worker output and independently verify edits and checks.
+7. Use exact-name cleanup dry-run first.
 
 ```bash
 cat > runtime-brief.md <<'EOF'
@@ -27,9 +28,9 @@ Investigate `refs`, `$(literal)`, and Unicode: 日本語.
 EOF
 pi-team-herdr launch --name runtime-research --cwd project-dir --new-workspace \
   --provider cvf --model muse --thinking high \
-  --brief-file runtime-brief.md --verify-working
-pi-team-herdr inspect --name runtime-research
-pi-team-herdr result --name runtime-research
+  --brief-file runtime-brief.md --verify-working \
+  --run-id review-123 --mailbox RUN/mailbox.json
+pi-team-herdr await --mailbox RUN/mailbox.json --all
 ```
 
 `--provider`, `--model`, and `--thinking` pass directly to Pi. Do not hardcode a provider or rely on the parent Pi model.
@@ -38,7 +39,9 @@ pi-team-herdr result --name runtime-research
 
 | Command | Purpose |
 |---|---|
-| `launch --name N --cwd P --new-workspace --brief-file P --verify-working` | Atomic workspace → Pi start → safe brief delivery → working verification. A dispatch failure reports that startup succeeded but dispatch failed. |
+| `launch ... --run-id R --mailbox P` | Atomic workspace → Pi start → safe brief delivery → working verification, then durable registration by stable workspace/pane identity. |
+| `await --mailbox P --any\|--all` | Make one blocking call and receive deduplicated terminal events with complete Pi results. Uses one adaptive central waiter rather than parent-agent status polling. |
+| `inbox --mailbox P` | Non-blocking delivery of terminal events that arrived while the parent did other work. Each consumer receives an event once. |
 | `inspect --name N` | Compact native state plus session evidence, workspace and pane traceability. |
 | `prompt --name N --file P` | Submit one complete Pi user turn safely. `--text` is only for short literal input. |
 | `resume --name N --file P` | Inspect then continue an existing live worker. |
@@ -48,6 +51,8 @@ pi-team-herdr result --name runtime-research
 | `docs check` | Ensure this skill only documents tested wrapper commands. |
 
 Stable names are preferred. `--pane-id` and `send --manifest` remain advanced legacy controls; `send` intentionally requires `--manifest`. The earlier documented pane-id send example failed because this wrapper’s legacy `send` is manifest-bound. Name-based `prompt` and `resume` resolve the native registry without an ambiguous manifest.
+
+Use one mailbox outside the repository per orchestration run and pass the same explicit `--run-id` to every launch. `await --any` returns the next result; repeat it to consume parallel workers as they finish. `await --all` returns only after every selected worker finishes or blocks. Before the main agent finalizes, it must drain `inbox` once and, if required workers remain, call `await` instead of asking the user to request a status check. Full durability, deduplication, identity, and event semantics: [references/mailbox.md](references/mailbox.md).
 
 ## State interpretation and resume
 

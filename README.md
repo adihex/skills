@@ -40,6 +40,19 @@ git diff --check
 Python runtime scripts are checked with Ruff and compileall; ShellCheck is run only on files ending in `.sh`.
 
 The golden gate runs G1–G10 against fake Herdr/Git/GitHub commands and disposable temporary Git repositories. It never requires GitHub authentication or deletes a real checkout. A failed scenario blocks release.
+
+## Herdr worker mailbox
+
+Register modern Pi workers in one untracked run mailbox, then make one blocking call instead of repeatedly checking worker status:
+
+```bash
+pi-team-herdr launch --name review-worker --cwd WORKTREE --new-workspace \
+  --brief-file BRIEF --verify-working --run-id review-123 --mailbox RUN/mailbox.json
+pi-team-herdr await --mailbox RUN/mailbox.json --all
+```
+
+`await --any` returns the next completed or blocked worker. `await --all` waits for all selected workers. `inbox` performs one non-blocking observation and delivers anything ready. Done events include the complete final Pi assistant result from its session artifact; blocked events remain intervention states. Mailbox delivery never marks the Git/review/check workflow complete. See `skills/herdr-pi-team/references/mailbox.md` for identity, deduplication, and concurrency guarantees.
+
 ## Hax backend
 
 Pi remains the default in every runtime. Hax is explicit opt-in and uses one shared backend with thin runtime adapters:
