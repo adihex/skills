@@ -1,0 +1,9 @@
+{
+  "sanitized": true,
+  "herdrVersion": "0.8.2-preview.2026-08-19-b5c4a0176e91",
+  "protocol": 20,
+  "schemaVersion": 1,
+  "requiredCommands": ["agent list", "agent get", "agent start", "agent prompt", "agent read", "workspace create", "pane list"],
+  "agentStates": ["idle", "working", "blocked", "done", "unknown"],
+  "notes": "Captured from `herdr api schema --json`; deliberately excludes paths, session state, prompt/output, credentials, and environment values."
+}
