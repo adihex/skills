@@ -1,0 +1,9 @@
+{
+  "minimumHerdrVersion": "0.8.2",
+  "maximumTestedHerdrVersion": "0.8.2-preview.2026-08-19-b5c4a0176e91",
+  "minimumPiVersion": "0.84.3",
+  "maximumTestedPiVersion": "0.84.3",
+  "wrapperVersion": "0.3.0",
+  "fixture": "herdr-0.8.2-preview.schema.json",
+  "policy": "Newer versions are capability-probed and warned, never blocked by version alone."
+}

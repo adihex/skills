@@ -28,9 +28,10 @@ store_module = load("manifest_store", "manifest_store.py")
 cleanup_module = load("cleanup", "cleanup.py")
 git_gate_module = load("git_gate", "git_gate.py")
 state_module = load("run_state", "run_state.py")
+modern_module = load("modern_adapter", "modern_adapter.py")
 
 NAME = "pi-team-herdr"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def emit(value):
@@ -54,6 +55,21 @@ def branch_for(cwd: str) -> str:
     result = subprocess.run(["git", "-C", cwd, "branch", "--show-current"], capture_output=True, text=True, timeout=20, shell=False)
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
 
+
+def modern_adapter(args):
+    return modern_module.ModernHerdrAdapter(args.herdr_command, args.session, args.timeout)
+
+
+def prompt_text(args):
+    if getattr(args, "file", None):
+        return modern_module.ModernHerdrAdapter.read_prompt(args.file)
+    if getattr(args, "text", None):
+        return args.text
+    raise modern_module.ModernAdapterError("PROMPT_REQUIRED", "provide --file or --text")
+
+
+def modern_error(exc):
+    fail(3 if exc.safety else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
 
 def adapter(args):
     config = {"backend": getattr(args, "backend", "pi")}
@@ -184,6 +200,8 @@ def main(argv=None):
     launch.add_argument("--thinking", choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
 
     launch.add_argument("--setup-timeout", type=float, default=30.0)
+    launch.add_argument("--new-workspace", action="store_true", help="create an isolated workspace (modern Herdr lifecycle)")
+    launch.add_argument("--verify-working", action="store_true", help="require prompt delivery and working state")
 
     send = sub.add_parser("send")
     send.add_argument("--manifest", required=True)
@@ -193,6 +211,29 @@ def main(argv=None):
     status = sub.add_parser("status")
     status.add_argument("--manifest", required=True)
 
+    prompt = sub.add_parser("prompt", help="submit a complete Pi user turn by stable worker name")
+    prompt.add_argument("--name", required=True)
+    prompt.add_argument("--file", help="required for multiline or shell-sensitive content")
+    prompt.add_argument("--text", help="short literal input only")
+    inspect = sub.add_parser("inspect", help="combine native state with Pi session evidence")
+    inspect.add_argument("--name", required=True)
+    result = sub.add_parser("result", help="retrieve the complete final Pi assistant result")
+    result.add_argument("--name", required=True)
+    resume = sub.add_parser("resume", help="inspect then continue a named Pi worker")
+    resume.add_argument("--name", required=True)
+    resume.add_argument("--file", help="required for multiline or shell-sensitive content")
+    resume.add_argument("--text", help="short literal input only")
+    resume.add_argument("--force", action="store_true", help="permit steering a working worker")
+    resume.add_argument("--confirm-completed", action="store_true", help="allow reopening a completed worker")
+
+    compatibility = sub.add_parser("compatibility")
+    compatibility_sub = compatibility.add_subparsers(dest="compatibility_command", required=True)
+    snapshot = compatibility_sub.add_parser("snapshot")
+    snapshot.add_argument("--output", help="write sanitized fixture JSON to this path")
+    compatibility_sub.add_parser("check")
+    docs = sub.add_parser("docs")
+    docs_sub = docs.add_subparsers(dest="docs_command", required=True)
+    docs_sub.add_parser("check")
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument("--manifest", default=None)
     reconcile.add_argument("--run", dest="run_id", default=None)
@@ -238,6 +279,71 @@ def main(argv=None):
         return
     try:
         mux = adapter(args)
+        if args.command in {"prompt", "inspect", "result", "resume", "compatibility", "docs"} or (args.command == "doctor" and args.backend == "pi") or (args.command == "launch" and args.new_workspace):
+            modern = modern_adapter(args)
+            if args.command == "doctor":
+                capabilities = modern.capabilities()
+                missing = [name for name, present in capabilities["commands"].items() if not present]
+                emit({"wrapperVersion": VERSION, "herdrVersion": modern.version(), "piVersion": subprocess.run([args.pi_command, "--version"], capture_output=True, text=True, shell=False).stdout.strip() or None, "session": args.session, "capabilities": capabilities, "compatibility": "blocked" if missing else "compatible", "missing": missing})
+                return
+            if args.command == "compatibility":
+                capabilities = modern.capabilities()
+                fixture_path = Path(__file__).resolve().parents[1] / "references" / "herdr-0.8.2-preview.schema.json"
+                fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+                snapshot = {"sanitized": True, "herdrVersion": modern.version(), "protocol": capabilities["protocol"], "schemaVersion": capabilities["schemaVersion"], "requiredCommands": list(capabilities["commands"]), "agentStates": capabilities["states"]}
+                if args.compatibility_command == "snapshot":
+                    if args.output:
+                        Path(args.output).write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    emit(snapshot); return
+                missing = [name for name in fixture["requiredCommands"] if not capabilities["commands"].get(name)]
+                changed_states = fixture["agentStates"] != capabilities["states"]
+                emit({"herdrVersion": modern.version(), "latestTested": fixture["herdrVersion"], "compatible": [name for name in fixture["requiredCommands"] if name not in missing], "missing": missing, "changedStates": changed_states, "result": "blocked" if missing else ("unknown" if changed_states else "compatible")})
+                return
+            if args.command == "docs":
+                documented = Path(__file__).resolve().parents[1] / "SKILL.md"
+                required = ["launch", "inspect", "prompt", "resume", "result", "doctor", "compatibility check", "docs check"]
+                content = documented.read_text(encoding="utf-8")
+                missing = [item for item in required if item not in content]
+                if missing:
+                    raise modern_module.ModernAdapterError("DOCS_DRIFT", "SKILL.md omits tested wrapper commands", details={"missing": missing})
+                emit({"ok": True, "checked": required})
+                return
+            if args.command == "launch":
+                brief = modern_module.ModernHerdrAdapter.read_prompt(args.brief_file)
+                workspace = modern.create_workspace(args.cwd, args.name) if args.new_workspace else {"workspace_id": args.workspace}
+                workspace_id = str(workspace.get("workspace_id") or workspace.get("id") or "")
+                if not workspace_id:
+                    raise modern_module.ModernAdapterError("WORKSPACE_REQUIRED", "modern launch requires --new-workspace or --workspace")
+                started = modern.start_worker(name=args.name, cwd=args.cwd, workspace_id=workspace_id, provider=args.provider, model=args.model, thinking=args.thinking, extension=args.extension)
+                try:
+                    dispatched = modern.prompt_worker({"name": args.name}, brief, wait_for_working=args.verify_working)
+                except modern_module.ModernAdapterError as exc:
+                    raise modern_module.ModernAdapterError("DISPATCH_FAILED_AFTER_START", "worker startup succeeded but brief dispatch failed", details={"workspaceId": workspace_id, "paneId": started.get("pane_id"), "cause": exc.code}) from exc
+                native = dispatched.get("agent_status") or dispatched.get("status")
+                if args.verify_working and native != "working":
+                    raise modern_module.ModernAdapterError("LAUNCH_NOT_WORKING", "brief was delivered but worker did not transition to working", details={"nativeStatus": native, "workspaceId": workspace_id, "paneId": started.get("pane_id")})
+                emit({"launched": True, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native})
+                return
+            worker = modern.resolve_worker(args.name)
+            if args.command == "inspect":
+                emit(modern.inspect_worker(worker)); return
+            if args.command == "result":
+                emit(modern.result(worker)); return
+            if args.command == "prompt":
+                text = prompt_text(args)
+                sent = modern.prompt_worker(worker, text)
+                emit({"name": args.name, "workspaceId": worker.get("workspace_id"), "paneId": worker.get("pane_id"), "submitted": True, "nativeStatus": sent.get("agent_status") or sent.get("status")}); return
+            if args.command == "resume":
+                inspection = modern.inspect_worker(worker)
+                if inspection["interpretation"] == "working" and not args.force:
+                    raise modern_module.ModernAdapterError("WORKER_WORKING", "refusing to interrupt a working worker; use --force for deliberate steering", safety=True)
+                if inspection["interpretation"] == "completed" and not args.confirm_completed:
+                    raise modern_module.ModernAdapterError("WORKER_COMPLETED", "completed work requires --confirm-completed before reopening", safety=True)
+                if inspection["nativeStatus"] == "blocked":
+                    raise modern_module.ModernAdapterError("WORKER_BLOCKED", "worker is blocked; resolve its blocker before continuing", details={"inspection": inspection}, safety=True)
+                text = prompt_text(args)
+                sent = modern.prompt_worker(worker, text)
+                emit({"name": args.name, "workspaceId": worker.get("workspace_id"), "paneId": worker.get("pane_id"), "resumed": True, "nativeStatus": sent.get("agent_status") or sent.get("status")}); return
         if args.command == "doctor":
             payload = {"backend": mux.config.backend, "runtime": "herdr", "capabilities": mux.hax.capabilities(mux.config, runtime="herdr")}
             if mux.config.backend == "hax":
@@ -364,6 +470,8 @@ def main(argv=None):
             emit(mux.status(manifest))
     except cleanup_module.CleanupError as exc:
         fail(3 if exc.code == "CLEANUP_REFUSED" else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
+    except modern_module.ModernAdapterError as exc:
+        modern_error(exc)
     except adapter_module.AdapterError as exc:
         fail(2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
 
