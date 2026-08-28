@@ -1,6 +1,6 @@
 ---
 name: herdr-pi-team
-description: Safely launch, inspect, steer, resume, retrieve results from, and clean up named Pi workers through Herdr. Use for Herdr Pi worker lifecycle or compatibility diagnosis.
+description: Safely manage named Pi workers through Herdr. Use when launching, inspecting, steering, resuming, retrieving results, cleaning workers, or checking Herdr/Pi compatibility.
 license: MIT
 compatibility: [herdr, pi]
 risk: destructive-operations-gated
@@ -22,12 +22,12 @@ Use `pi-team-herdr` for the common worker lifecycle. JSON is default. Use the sa
 6. Use exact-name cleanup dry-run first.
 
 ```bash
-cat > /tmp/runtime-brief.md <<'EOF'
+cat > runtime-brief.md <<'EOF'
 Investigate `refs`, `$(literal)`, and Unicode: 日本語.
 EOF
-pi-team-herdr launch --name runtime-research --cwd /repo --new-workspace \
+pi-team-herdr launch --name runtime-research --cwd project-dir --new-workspace \
   --provider cvf --model muse --thinking high \
-  --brief-file /tmp/runtime-brief.md --verify-working
+  --brief-file runtime-brief.md --verify-working
 pi-team-herdr inspect --name runtime-research
 pi-team-herdr result --name runtime-research
 ```
@@ -70,8 +70,8 @@ The installed Herdr binary is runtime truth: `herdr --version`, `herdr api schem
 Legacy manifest cleanup is intentionally explicit and dry-run first:
 
 ```bash
-pi-team-herdr cleanup --manifest /tmp/runtime.json --worktree-root /worktrees \
-  --main-checkout /repo
+pi-team-herdr cleanup --manifest worker-manifest.json --worktree-root worktrees \
+  --main-checkout main-checkout
 # inspect JSON, then repeat with --confirm
 ```
 
