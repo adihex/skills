@@ -6,6 +6,7 @@
 - Add blocking `await --any|--all` delivery and non-blocking `inbox` draining with per-consumer deduplication.
 - Return complete Pi session results with terminal events while refusing workspace/pane identity changes.
 - Centralize bounded adaptive worker observation so parent agents no longer repeatedly poll status.
+- Accept an immediately completed turn during launch verification instead of misreporting a fast successful dispatch as failed.
 
 ## 0.3.0
 

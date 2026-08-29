@@ -140,7 +140,9 @@ class ModernHerdrAdapter:
         # shell-sensitive bytes and cannot invoke a shell.
         args = ["agent", "prompt", target, text]
         if wait_for_working:
-            args += ["--wait", "--until", "working", "--timeout", "5000"]
+            # A fast turn can reach done before Herdr observes working. Both states
+            # prove accepted dispatch; blocked is included so it returns promptly.
+            args += ["--wait", "--until", "working", "--until", "done", "--until", "blocked", "--timeout", "5000"]
         result = self._json(args, "agent prompt")
         return result["agent"] if isinstance(result.get("agent"), dict) else result
 

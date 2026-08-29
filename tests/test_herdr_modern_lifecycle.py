@@ -39,7 +39,7 @@ elif args[:2] == ["agent", "start"]: record("agent.start"); out({"name": args[2]
 elif args[:2] == ["agent", "prompt"]:
     record("agent.prompt")
     if scenario == "dispatch-fails": print(json.dumps({"error": {"code": "agent_prompt_stalled"}})); sys.exit(1)
-    out({"name": args[2], "agent_status": "working", "pane_id": "w-new:p1", "workspace_id": "w-new", "tab_id": "t-new"})
+    out({"name": args[2], "agent_status": "done" if scenario == "fast-done" else "working", "pane_id": "w-new:p1", "workspace_id": "w-new", "tab_id": "t-new"})
 elif args[:2] == ["agent", "read"]: out({"text": "terminal tail only"})
 elif args[:2] == ["workspace", "list"]: out({"workspaces": []})
 else: print(json.dumps({"error": {"code": "unknown", "message": " ".join(args)}})); sys.exit(1)
@@ -97,6 +97,16 @@ class ModernLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2); self.assertIn("DISPATCH_FAILED_AFTER_START", result.stderr)
         start = next(c for c in self.calls() if c["op"] == "agent.start")["args"]
         self.assertIn("--provider", start); self.assertIn("cvf", start); self.assertIn("--model", start); self.assertIn("muse", start); self.assertIn("--thinking", start); self.assertIn("high", start)
+
+    def test_verify_working_accepts_a_turn_that_finishes_before_working_is_observed(self):
+        prompt, _ = self.prompt_file("fast deterministic turn")
+        result = self.invoke("launch", "--name", "runtime-research", "--cwd", "/repo", "--new-workspace",
+                             "--brief-file", str(prompt), "--verify-working", scenario="fast-done")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["nativeStatus"], "done")
+        prompt_call = next(c for c in self.calls() if c["op"] == "agent.prompt")["args"]
+        self.assertEqual(prompt_call.count("--until"), 3)
+        self.assertIn("working", prompt_call); self.assertIn("done", prompt_call); self.assertIn("blocked", prompt_call)
 
     def test_result_reads_complete_final_assistant_message_from_session_not_terminal(self):
         session = self.root / "worker.jsonl"

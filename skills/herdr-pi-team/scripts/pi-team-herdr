@@ -276,7 +276,7 @@ def main(argv=None):
 
     launch.add_argument("--setup-timeout", type=float, default=30.0)
     launch.add_argument("--new-workspace", action="store_true", help="create an isolated workspace (modern Herdr lifecycle)")
-    launch.add_argument("--verify-working", action="store_true", help="require prompt delivery and working state")
+    launch.add_argument("--verify-working", action="store_true", help="require prompt delivery and working or immediate done state")
 
     send = sub.add_parser("send")
     send.add_argument("--manifest", required=True)
@@ -416,8 +416,8 @@ def main(argv=None):
                 except modern_module.ModernAdapterError as exc:
                     raise modern_module.ModernAdapterError("DISPATCH_FAILED_AFTER_START", "worker startup succeeded but brief dispatch failed", details={"workspaceId": workspace_id, "paneId": started.get("pane_id"), "cause": exc.code}) from exc
                 native = dispatched.get("agent_status") or dispatched.get("status")
-                if args.verify_working and native != "working":
-                    raise modern_module.ModernAdapterError("LAUNCH_NOT_WORKING", "brief was delivered but worker did not transition to working", details={"nativeStatus": native, "workspaceId": workspace_id, "paneId": started.get("pane_id")})
+                if args.verify_working and native not in {"working", "done"}:
+                    raise modern_module.ModernAdapterError("LAUNCH_NOT_WORKING", "brief was delivered but worker did not transition to working or done", details={"nativeStatus": native, "workspaceId": workspace_id, "paneId": started.get("pane_id")})
                 registration = None
                 if args.mailbox:
                     registration = mailbox_module.MailboxStore(args.mailbox).register(run_id=args.run_id, name=args.name, workspace_id=workspace_id, pane_id=str(started.get("pane_id") or ""))
