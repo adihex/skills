@@ -38,7 +38,7 @@ sys.modules[dispatch_spec.name] = dispatch_module
 dispatch_spec.loader.exec_module(dispatch_module)
 
 NAME = "pi-team-herdr"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 
 def emit(value):
@@ -51,6 +51,56 @@ def fail(code: int, error_code: str, message: str, suggestion: str | None = None
         value["suggestion"] = suggestion
     print(json.dumps(value, ensure_ascii=False), file=sys.stderr)
     raise SystemExit(code)
+
+
+def _shorten_path(value: str, limit: int = 48) -> str:
+    """Shorten long filesystem paths for TUI display without truncation confusion.
+
+    Replaces $HOME with ~ and middle-truncates with … when still too long,
+    preserving both prefix and suffix so the mailbox/worktree remains identifiable.
+    """
+    if not value:
+        return value
+    home = os.path.expanduser("~")
+    if value.startswith(home):
+        value = "~" + value[len(home):]
+    if len(value) <= limit:
+        return value
+    keep = limit - 1
+    left = keep // 2
+    right = keep - left
+    return value[:left] + "…" + value[-right:]
+
+
+def _human_events(events: list[dict], mailbox_path: str) -> None:
+    if not events:
+        print(f"inbox empty · mailbox {_shorten_path(mailbox_path)}")
+        return
+    width = max(len(e.get("worker", "")) for e in events)
+    for event in events:
+        worker = event.get("worker", "?")
+        kind = event.get("kind", "")
+        outcome = event.get("outcome", "")
+        if kind == "worker.turn_finished":
+            symbol = "✓"
+            result = event.get("result") or ""
+            preview = result.splitlines()[0][:72] if result else ""
+            suffix = f" — {preview}" if preview else ""
+            print(f"{symbol} {worker:<{width}}  {outcome} {suffix}")
+        elif kind == "worker.blocked":
+            symbol = "◐ blocked"
+            print(f"{symbol} {worker:<{width}}  needs intervention")
+        else:
+            print(f"• {worker:<{width}}  {kind}/{outcome}")
+    print(f"— {len(events)} event(s) from {_shorten_path(mailbox_path)}")
+
+
+def _human_launch(payload: dict) -> None:
+    mailbox = payload.get("mailbox")
+    mailbox_str = f" · mailbox {_shorten_path(str(mailbox))}" if mailbox else ""
+    print(f"✓ launched {payload.get('worker')} → workspace {payload.get('workspaceId')} pane {payload.get('paneId')}{mailbox_str}")
+    if payload.get("workspaceId"):
+        print(f"  status: {payload.get('nativeStatus')}  cwd: {_shorten_path(str(payload.get('workspaceId')))}")
 
 
 class Parser(argparse.ArgumentParser):
@@ -283,6 +333,7 @@ def main(argv=None):
     launch.add_argument("--setup-timeout", type=float, default=30.0)
     launch.add_argument("--new-workspace", action="store_true", help="create an isolated workspace (modern Herdr lifecycle)")
     launch.add_argument("--verify-working", action="store_true", help="require prompt delivery and working or immediate done state")
+    launch.add_argument("--human", action="store_true", help="pretty human output instead of JSON")
 
     send = sub.add_parser("send")
     send.add_argument("--manifest", required=True)
@@ -298,8 +349,10 @@ def main(argv=None):
     prompt.add_argument("--text", help="short literal input only")
     inspect = sub.add_parser("inspect", help="combine native state with Pi session evidence")
     inspect.add_argument("--name", required=True)
+    inspect.add_argument("--human", action="store_true", help="pretty human output")
     result = sub.add_parser("result", help="retrieve the complete final Pi assistant result")
     result.add_argument("--name", required=True)
+    result.add_argument("--human", action="store_true", help="pretty human output")
     resume = sub.add_parser("resume", help="inspect then continue a named Pi worker")
     resume.add_argument("--name", required=True)
     resume.add_argument("--file", help="required for multiline or shell-sensitive content")
@@ -318,11 +371,13 @@ def main(argv=None):
     await_parser.add_argument("--timeout", dest="wait_timeout", type=float, default=1200.0)
     await_parser.add_argument("--poll-min", type=float, default=0.5, help=argparse.SUPPRESS)
     await_parser.add_argument("--poll-max", type=float, default=10.0, help=argparse.SUPPRESS)
+    await_parser.add_argument("--human", action="store_true", help="pretty human output")
 
     inbox = sub.add_parser("inbox", help="non-blocking delivery of completed worker events")
     inbox.add_argument("--mailbox", required=True)
     inbox.add_argument("--name", action="append", default=None)
     inbox.add_argument("--consumer", default="parent")
+    inbox.add_argument("--human", action="store_true", help="pretty human output")
 
     compatibility = sub.add_parser("compatibility")
     compatibility_sub = compatibility.add_subparsers(dest="compatibility_command", required=True)
@@ -448,14 +503,24 @@ def main(argv=None):
                 )
                 write_manifest(str(launch_manifest_path), manifest)
                 reservation.release()
-                emit({"launched": True, "runId": args.run_id, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native, "mailbox": args.mailbox, "registration": registration, "manifest_path": str(launch_manifest_path), "dispatch_admission": launch_admission})
+                payload = {"launched": True, "runId": args.run_id, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native, "mailbox": args.mailbox, "registration": registration, "manifest_path": str(launch_manifest_path), "dispatch_admission": launch_admission}
+                if getattr(args, "human", False):
+                    _human_launch(payload)
+                else:
+                    emit(payload)
                 return
             if args.command == "await":
                 if args.wait_timeout < 0 or args.poll_min <= 0 or args.poll_max < args.poll_min:
                     raise modern_module.ModernAdapterError("WAIT_CONFIG_INVALID", "timeout and polling bounds are invalid")
                 mailbox = mailbox_module.MailboxStore(args.mailbox)
-                emit(await_mailbox(modern, mailbox, names=args.name, consumer=args.consumer, wait_all=args.wait_all,
-                                   timeout=args.wait_timeout, poll_min=args.poll_min, poll_max=args.poll_max))
+                payload = await_mailbox(modern, mailbox, names=args.name, consumer=args.consumer, wait_all=args.wait_all,
+                                   timeout=args.wait_timeout, poll_min=args.poll_min, poll_max=args.poll_max)
+                if getattr(args, "human", False):
+                    _human_events(payload.get("events", []), args.mailbox)
+                    if not payload.get("waitSatisfied"):
+                        print(f"wait pending: {', '.join(payload.get('pending', []))}")
+                else:
+                    emit(payload)
                 return
             if args.command == "inbox":
                 mailbox = mailbox_module.MailboxStore(args.mailbox)
@@ -464,13 +529,30 @@ def main(argv=None):
                 if not events:
                     observe_mailbox(modern, mailbox, registrations)
                     events = mailbox.deliver(consumer=args.consumer, names=args.name)
-                emit({"events": enrich_mailbox_events(events), "count": len(events)})
+                enriched = enrich_mailbox_events(events)
+                if getattr(args, "human", False):
+                    _human_events(enriched, args.mailbox)
+                else:
+                    emit({"events": enriched, "count": len(enriched)})
                 return
             worker = modern.resolve_worker(args.name)
             if args.command == "inspect":
-                emit(modern.inspect_worker(worker)); return
+                data = modern.inspect_worker(worker)
+                if getattr(args, "human", False):
+                    print(f"{data.get('name')} · {data.get('nativeStatus')} → {data.get('interpretation')}  workspace {_shorten_path(str(data.get('workspaceId')))} pane {data.get('paneId')}")
+                    if data.get("sessionArtifact"):
+                        print(f"  artifact: {_shorten_path(str(data.get('sessionArtifact')))}")
+                else:
+                    emit(data)
+                return
             if args.command == "result":
-                emit(modern.result(worker)); return
+                data = modern.result(worker)
+                if getattr(args, "human", False):
+                    print(f"✓ {data.get('name')} — {_shorten_path(str(data.get('sessionArtifact')))}")
+                    print(data.get("result", ""))
+                else:
+                    emit(data)
+                return
             if args.command == "prompt":
                 text = prompt_text(args)
                 sent = modern.prompt_worker(worker, text)

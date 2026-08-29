@@ -31,31 +31,32 @@ EOF
 pi-team-herdr launch --name runtime-research --cwd project-dir --new-workspace \
   --provider cvf --model muse --thinking high \
   --brief-file runtime-brief.md --verify-working \
-  --run-id review-123 --mailbox RUN/mailbox.json
-pi-team-herdr await --mailbox RUN/mailbox.json --all
+  --run-id review-123 --mailbox RUN/mailbox.json --human
+pi-team-herdr await --mailbox RUN/mailbox.json --all --human
+# JSON remains default; omit --human for programmatic parsing
 ```
 
 `--provider`, `--model`, and `--thinking` pass directly to Pi. Do not hardcode a provider or rely on the parent Pi model.
 
 ## Everyday commands
 
-| Command | Purpose |
-|---|---|
-| `launch ... --run-id R --mailbox P` | Atomic workspace → Pi start → safe brief delivery → working verification, then durable registration by stable workspace/pane identity. |
-| `await --mailbox P --any\|--all` | Make one blocking call and receive deduplicated terminal events with complete Pi results. Uses one adaptive central waiter rather than parent-agent status polling. |
-| `inbox --mailbox P` | Non-blocking delivery of terminal events that arrived while the parent did other work. Each consumer receives an event once. |
-| `inspect --name N` | Compact native state plus session evidence, workspace and pane traceability. |
-| `prompt --name N --file P` | Submit one complete Pi user turn safely. `--text` is only for short literal input. |
-| `resume --name N --file P` | Inspect then continue an existing live worker. |
-| `result --name N` | Read the complete last Pi assistant message from its session artifact, not terminal viewport text. |
-| `doctor` | Check installed versions, session reachability, and required capabilities. |
-| `doctor --backend hax --provider codex --model MODEL` | Report Hax/Codex/auth presence and capabilities without reading credential contents. |
-| `launch --backend hax --provider codex --model MODEL --effort high --brief-file P` | Launch the explicit shell-backed Hax adapter; `--mode oneshot` is non-steerable. |
-| `status --manifest P` | Combine backend configuration/capabilities, native pane evidence, manifest state, Git, review, and checks. |
-| `compatibility snapshot` / `compatibility check` | Capture/check sanitized native capability contract. |
-| `docs check` | Ensure this skill only documents tested wrapper commands. |
+| Command | Purpose | Output |
+|---|---|---|
+| `launch ... --run-id R --mailbox P [--human]` | Atomic workspace → Pi start → safe brief delivery → working verification, then durable registration by stable workspace/pane identity. | JSON (default) or `✓ launched NAME → workspace … pane … · mailbox ~/…` with `--human` |
+| `await --mailbox P --any\|--all [--human]` | Make one blocking call and receive deduplicated terminal events with complete Pi results. Uses one adaptive central waiter rather than parent-agent status polling. | JSON or human table `✓ worker done — preview` |
+| `inbox --mailbox P [--human]` | Non-blocking delivery of terminal events that arrived while the parent did other work. Each consumer receives an event once. | JSON or human; `inbox empty · mailbox ~/…` when idle |
+| `inspect --name N [--human]` | Compact native state plus session evidence, workspace and pane traceability. | JSON or `NAME · status → interpretation` |
+| `prompt --name N --file P` | Submit one complete Pi user turn safely. `--text` is only for short literal input. | JSON |
+| `resume --name N --file P` | Inspect then continue an existing live worker. | JSON |
+| `result --name N [--human]` | Read the complete last Pi assistant message from its session artifact, not terminal viewport text. | JSON or full result text with `--human` |
+| `doctor` | Check installed versions, session reachability, and required capabilities. | JSON |
+| `doctor --backend hax --provider codex --model MODEL` | Report Hax/Codex/auth presence and capabilities without reading credential contents. | JSON |
+| `launch --backend hax --provider codex --model MODEL --effort high --brief-file P` | Launch the explicit shell-backed Hax adapter; `--mode oneshot` is non-steerable. | JSON |
+| `status --manifest P` | Combine backend configuration/capabilities, native pane evidence, manifest state, Git, review, and checks. | JSON |
+| `compatibility snapshot` / `compatibility check` | Capture/check sanitized native capability contract. | JSON |
+| `docs check` | Ensure this skill only documents tested wrapper commands. | JSON |
 
-Stable names are preferred. `--pane-id` and `send --manifest` remain advanced legacy controls; `send` intentionally requires `--manifest`. The earlier documented pane-id send example failed because this wrapper’s legacy `send` is manifest-bound. Name-based `prompt` and `resume` resolve the native registry without an ambiguous manifest.
+Stable names are preferred. Add `--human` to `launch`, `await`, `inbox`, `inspect`, or `result` for TUI-friendly output — long paths are shortened to `~/…` with middle-truncation (`…`) so `readlink ~/…` style overflow never hides the mailbox or workspace identity. JSON remains the default for programmatic use. `--pane-id` and `send --manifest` remain advanced legacy controls; `send` intentionally requires `--manifest`. The earlier documented pane-id send example failed because this wrapper’s legacy `send` is manifest-bound. Name-based `prompt` and `resume` resolve the native registry without an ambiguous manifest.
 
 Use one mailbox outside the repository per orchestration run and pass the same explicit `--run-id` to every launch. `await --any` returns the next result; repeat it to consume parallel workers as they finish. `await --all` returns only after every selected worker finishes or blocks. Before the main agent finalizes, it must drain `inbox` once and, if required workers remain, call `await` instead of asking the user to request a status check. Full durability, deduplication, identity, and event semantics: [references/mailbox.md](references/mailbox.md).
 

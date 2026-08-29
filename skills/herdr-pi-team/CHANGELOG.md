@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Add `--human` pretty output to `launch`, `await`, `inbox`, `inspect`, `result` with middle-truncated `~/…` paths to avoid TUI overflow (`readlink ~/…`).
+- Harden mailbox adaptive wait test against cold-start shebang latency (0.43s) on macOS.
+- Fix local skill links to direct canonical target across pi/gemini/forge/cursor/codex hosts.
+
 ## 0.4.0
 
 - Add a durable per-run worker mailbox with locked, atomic state and append-only idempotent events.
