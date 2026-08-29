@@ -30,6 +30,12 @@ git_gate_module = load("git_gate", "git_gate.py")
 state_module = load("run_state", "run_state.py")
 modern_module = load("modern_adapter", "modern_adapter.py")
 mailbox_module = load("mailbox", "mailbox.py")
+dispatch_spec = importlib.util.spec_from_file_location("shared_dispatch_control_herdr", Path(__file__).resolve().parents[3] / "scripts" / "dispatch_control.py")
+if dispatch_spec is None or dispatch_spec.loader is None:
+    raise ImportError("shared dispatch control is unavailable")
+dispatch_module = importlib.util.module_from_spec(dispatch_spec)
+sys.modules[dispatch_spec.name] = dispatch_module
+dispatch_spec.loader.exec_module(dispatch_module)
 
 NAME = "pi-team-herdr"
 VERSION = "0.4.0"
@@ -371,7 +377,20 @@ def main(argv=None):
         return
     try:
         mux = adapter(args)
-        if args.command in {"prompt", "inspect", "result", "resume", "await", "inbox", "compatibility", "docs"} or (args.command == "doctor" and args.backend == "pi") or (args.command == "launch" and (args.new_workspace or args.mailbox)):
+        reservation = None
+        launch_manifest_path = None
+        launch_admission = None
+        if args.command == "launch":
+            if args.mailbox and args.backend != "pi":
+                raise modern_module.ModernAdapterError("MAILBOX_BACKEND_UNSUPPORTED", "the modern worker mailbox currently supports Pi workers only")
+            safe_name = "".join(character if character.isalnum() or character in "_.-" else "-" for character in args.name).strip("-") or "worker"
+            launch_manifest_path = Path(args.manifest or f"/tmp/team-task/manifests/{safe_name}.json")
+            reservation = dispatch_module.LaunchReservation(launch_manifest_path.parent, mux.config.backend)
+            try:
+                launch_admission = reservation.acquire()
+            except dispatch_module.policy_module.DispatchRefused as exc:
+                fail(3, exc.code, str(exc), "wait for a tracked worker to finish or adjust the documented limits")
+        if args.command in {"prompt", "inspect", "result", "resume", "await", "inbox", "compatibility", "docs"} or (args.command == "doctor" and args.backend == "pi") or (args.command == "launch" and (args.new_workspace or args.mailbox) and args.backend == "pi"):
             modern = modern_adapter(args)
             if args.command == "doctor":
                 capabilities = modern.capabilities()
@@ -421,7 +440,15 @@ def main(argv=None):
                 registration = None
                 if args.mailbox:
                     registration = mailbox_module.MailboxStore(args.mailbox).register(run_id=args.run_id, name=args.name, workspace_id=workspace_id, pane_id=str(started.get("pane_id") or ""))
-                emit({"launched": True, "runId": args.run_id, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native, "mailbox": args.mailbox, "registration": registration})
+                manifest = adapter_module.hax_backend.worker_manifest(
+                    config=mux.config, runtime="herdr", run_id=args.run_id or f"run-{int(time.time())}", label=args.name,
+                    workspace_id=workspace_id, tab_id=str(started.get("tab_id") or "unknown"), pane_id=str(started.get("pane_id") or "unknown"),
+                    cwd=args.cwd, state="working" if native == "working" else "verifying", branch=args.branch or branch_for(args.cwd),
+                    worktree=os.path.abspath(args.worktree or args.cwd), dispatch_admission=launch_admission,
+                )
+                write_manifest(str(launch_manifest_path), manifest)
+                reservation.release()
+                emit({"launched": True, "runId": args.run_id, "worker": args.name, "workspaceId": workspace_id, "paneId": started.get("pane_id"), "process": started.get("terminal_id"), "sessionArtifact": started.get("agent_session"), "provider": args.provider, "model": args.model, "thinking": args.thinking, "nativeStatus": native, "mailbox": args.mailbox, "registration": registration, "manifest_path": str(launch_manifest_path), "dispatch_admission": launch_admission})
                 return
             if args.command == "await":
                 if args.wait_timeout < 0 or args.poll_min <= 0 or args.poll_max < args.poll_min:
@@ -479,13 +506,14 @@ def main(argv=None):
             manifest.setdefault("session", args.session)
             manifest.setdefault("herdr_command", args.herdr_command)
             store = store_module.ManifestStore.from_path(args.manifest)
-            if args.confirm and manifest.get("backend") == "hax":
-                shutdown = mux.stop(manifest)
-                manifest["backend_shutdown"] = shutdown
-                store.write(manifest)
+            def close_worker(value):
+                if value.get("backend") == "hax":
+                    value["backend_shutdown"] = mux.stop(value)
+                    store.write(value)
+                cleanup_module.CleanupManager._close_workspace(value)
             manager = cleanup_module.CleanupManager(
                 worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
-                manifest_writer=store.write,
+                manifest_writer=store.write, workspace_closer=close_worker,
             )
             emit(manager.cleanup(manifest, confirm=args.confirm, require_pushed=args.require_pushed))
             return
@@ -529,10 +557,13 @@ def main(argv=None):
                                setup_timeout=args.setup_timeout)
             value["session"] = args.session
             value["herdr_command"] = args.herdr_command
+            value["dispatch_admission"] = launch_admission
             backend_output = value.pop("_backend_output", None)
-            write_manifest(args.manifest, value)
+            write_manifest(str(launch_manifest_path), value)
+            reservation.release()
             if backend_output:
                 value["backend_output"] = backend_output
+            value["manifest_path"] = str(launch_manifest_path)
             emit(value)
             return
         if args.command == "reconcile":

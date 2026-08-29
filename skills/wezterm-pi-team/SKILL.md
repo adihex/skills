@@ -41,6 +41,7 @@ pi-team-pane send --pane-id ID --text TEXT [--require-idle]
 pi-team-pane status [--status-root DIR] [--dispatch DIR]
 pi-team-pane status --tail PANE --lines N
 pi-team-pane cleanup --pattern REGEX [--confirm]
+pi-team-pane cleanup --manifest FILE --worktree-root ROOT --main-checkout CHECKOUT [--confirm]
 pi-team-pane doctor --backend hax --provider codex --model MODEL
 pi-team-pane complete --manifest FILE --report FILE --repository OWNER/REPO
 ```
@@ -54,5 +55,6 @@ JSON is the default. Exit `0` is success, `1` usage, `2` WezTerm/runtime failure
 - Never treat `send-text` alone as submission; use the bundled fenced send.
 - Never kill by a broad process or title pattern without a dry-run review.
 - Do not remove a dirty or unsynchronized worktree; use the Herdr cleanup contract for lifecycle-owned worktrees.
+- Pattern cleanup is manual pane cleanup only and never marks a worker complete. Manifest cleanup applies the shared state, Git, ownership, scoped-process, and worktree-removal transaction.
 
 The durable state, review, and cleanup contracts live in [herdr-pi-team](../herdr-pi-team/SKILL.md). The dogfood gate is [pi-dogfood-os](../pi-dogfood-os/SKILL.md).

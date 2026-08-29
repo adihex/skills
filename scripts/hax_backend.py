@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -133,7 +134,7 @@ def capabilities_for(backend: str = "hax", runtime: str = "unknown") -> dict[str
     if backend == "pi":
         return {
             "backend": "pi", "runtime": runtime, "interactive": True, "one_shot": True,
-            "native_state": True, "subscription_auth": False, "steerable": True,
+            "native_state": runtime == "herdr", "subscription_auth": False, "steerable": True,
             "resume_supported": True, "requires_explicit_model": False,
         }
     if backend != "hax":
@@ -152,6 +153,36 @@ def limitations_for(backend: str = "hax", mode: str = "interactive") -> list[str
     if mode == "oneshot":
         limitations.append("live_steering_unavailable")
     return limitations
+
+
+def worker_manifest(*, config: BackendConfig, runtime: str, run_id: str, label: str,
+                    workspace_id: str, tab_id: str, pane_id: str | int, cwd: str,
+                    state: str, branch: str = "unknown", blocker: str | None = None,
+                    **extra: Any) -> dict[str, Any]:
+    """Build the common schema-required manifest fields for pane runtimes."""
+    absolute_cwd = os.path.abspath(cwd)
+    manifest = {
+        "run_id": run_id,
+        "label": label,
+        "workspace_id": workspace_id,
+        "tab_id": tab_id,
+        "pane_id": str(pane_id),
+        "cwd": absolute_cwd,
+        "worktree": absolute_cwd,
+        "branch": branch or "unknown",
+        "upstream": None,
+        "state": state,
+        "head_sha": None,
+        "pushed_sha": None,
+        "pr_number": None,
+        "review_status": "pending",
+        "checks_status": "pending",
+        "last_heartbeat": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "blocker": blocker,
+        **config.manifest_fields(runtime=runtime),
+    }
+    manifest.update(extra)
+    return manifest
 
 
 
@@ -363,5 +394,5 @@ def config_from_mapping(value: Mapping[str, Any] | None) -> BackendConfig:
 
 __all__ = [
     "AUTH_SOURCES", "BACKENDS", "EFFORTS", "HAX_MIN_VERSION", "MODES", "BackendConfig",
-    "HaxBackend", "HaxConfigError", "HaxLifecycleError", "HaxPreflightError", "capabilities_for", "config_from_mapping", "limitations_for",
+    "HaxBackend", "HaxConfigError", "HaxLifecycleError", "HaxPreflightError", "capabilities_for", "config_from_mapping", "limitations_for", "worker_manifest",
 ]

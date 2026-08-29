@@ -2,7 +2,7 @@
 name: herdr-pi-team
 description: Safely manage named Pi workers through Herdr. Use when launching, inspecting, steering, resuming, retrieving results, cleaning workers, or checking Herdr/Pi compatibility.
 license: MIT
-compatibility: [herdr, pi]
+compatibility: [herdr, pi, hax]
 risk: destructive-operations-gated
 category: orchestration
 tags: [herdr, pi, workers, lifecycle, compatibility]
@@ -11,6 +11,8 @@ tags: [herdr, pi, workers, lifecycle, compatibility]
 # herdr-pi-team
 
 Use `pi-team-herdr` for the common worker lifecycle. JSON is default. Use the same `--session NAME` as the visible Herdr client; mixing default and named sessions hides workers.
+
+Pi is the default backend. Hax 0.3.0+ is explicit opt-in and uses the official Codex CLI subscription authentication from `codex login`; no API key is required. Herdr has no native Hax agent kind, so the adapter starts Hax in a shell-backed pane, waits for readiness, and then uses verified literal send, separate Enter, and readback. Never silently fall back to Pi. HTTP 429 is `blocked_external`, not success. See [references/hax-backend.md](references/hax-backend.md).
 
 ## Safe lifecycle
 
@@ -47,6 +49,9 @@ pi-team-herdr await --mailbox RUN/mailbox.json --all
 | `resume --name N --file P` | Inspect then continue an existing live worker. |
 | `result --name N` | Read the complete last Pi assistant message from its session artifact, not terminal viewport text. |
 | `doctor` | Check installed versions, session reachability, and required capabilities. |
+| `doctor --backend hax --provider codex --model MODEL` | Report Hax/Codex/auth presence and capabilities without reading credential contents. |
+| `launch --backend hax --provider codex --model MODEL --effort high --brief-file P` | Launch the explicit shell-backed Hax adapter; `--mode oneshot` is non-steerable. |
+| `status --manifest P` | Combine backend configuration/capabilities, native pane evidence, manifest state, Git, review, and checks. |
 | `compatibility snapshot` / `compatibility check` | Capture/check sanitized native capability contract. |
 | `docs check` | Ensure this skill only documents tested wrapper commands. |
 
@@ -81,5 +86,7 @@ pi-team-herdr cleanup --manifest worker-manifest.json --worktree-root worktrees 
 ```
 
 Never use broad patterns or terminate a pre-existing worker. If launch reports `DISPATCH_FAILED_AFTER_START`, inspect the reported workspace/pane, preserve it, and retry with `prompt --name ... --file ...` after resolving the native blocker.
+
+Launch admission is manifest-backed across all runtimes. Defaults are four total workers, four Pi workers, two Hax workers, two Codex subscription workers, and two concurrent setups. Override only with the documented `PI_TEAM_MAX_ACTIVE`, `PI_TEAM_MAX_ACTIVE_PI`, `PI_TEAM_MAX_ACTIVE_HAX`, `PI_TEAM_MAX_ACTIVE_CODEX`, and `PI_TEAM_SETUP_CONCURRENCY` environment variables.
 
 Do not trust a worker’s completion claim: independently inspect the diff and run the relevant checks.

@@ -99,6 +99,9 @@ class HerdrMailboxTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["registration"]["workspace_id"], "w-new")
         self.assertEqual(payload["registration"]["pane_id"], "w-new:p1")
+        manifest = json.loads(Path(payload["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["state"], "working")
+        self.assertTrue(manifest["dispatch_admission"]["admitted"])
         self.assertEqual(self.store().workers()[0]["name"], "worker")
 
     def test_await_any_returns_each_result_once_without_parent_polling(self):

@@ -53,6 +53,13 @@ class SkillValidationTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.assertIn("MISSING_REFERENCE", self.codes(validate(root)))
 
+    def test_missing_reference_from_progressive_resource(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        reference = root / "skills" / "demo-skill" / "references" / "contract.md"
+        reference.write_text("See [details](missing.md).\n", encoding="utf-8")
+        self.assertIn("MISSING_REFERENCE", self.codes(validate(root)))
+
     def test_non_executable_referenced_script(self):
         body = VALID_BODY.replace("references/contract.md", "scripts/check.py")
         temp, root = self.make_root(body, reference=False)

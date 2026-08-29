@@ -98,6 +98,14 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(stopped, [101])
         self.assertFalse(self.worktree.exists())
 
+    def test_cleanup_refuses_to_claim_process_shutdown_when_pid_remains(self):
+        inventory = [{"pid": 101, "kind": "nx", "cwd": str(self.worktree), "owned": True}]
+        manager = self.manager(inventory, process_stopper=lambda _: None, process_verifier=lambda _: False)
+        result = manager.cleanup(self.manifest(), confirm=True)
+        self.assertEqual(result["action"], "failed")
+        self.assertIn("owned process remains", result["error"])
+        self.assertTrue(self.worktree.exists())
+
     def test_current_checkout_is_never_removed(self):
         manifest = self.manifest(worktree=str(self.main))
         result = cleanup.CleanupManager(

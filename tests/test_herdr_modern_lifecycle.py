@@ -103,7 +103,11 @@ class ModernLifecycleTests(unittest.TestCase):
         result = self.invoke("launch", "--name", "runtime-research", "--cwd", "/repo", "--new-workspace",
                              "--brief-file", str(prompt), "--verify-working", scenario="fast-done")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["nativeStatus"], "done")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["nativeStatus"], "done")
+        manifest = json.loads(Path(payload["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["state"], "verifying")
+        self.assertTrue(manifest["dispatch_admission"]["admitted"])
         prompt_call = next(c for c in self.calls() if c["op"] == "agent.prompt")["args"]
         self.assertEqual(prompt_call.count("--until"), 3)
         self.assertIn("working", prompt_call); self.assertIn("done", prompt_call); self.assertIn("blocked", prompt_call)

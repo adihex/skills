@@ -168,6 +168,9 @@ class HaxBackendTests(unittest.TestCase):
         self.assertFalse(fields["backend_capabilities"]["native_state"])
         self.assertIsNone(fields["backend_session_id"])
         self.assertNotIn("auth.json", str(fields))
+        self.assertTrue(MODULE.capabilities_for("pi", "herdr")["native_state"])
+        self.assertFalse(MODULE.capabilities_for("pi", "tmux")["native_state"])
+        self.assertFalse(MODULE.capabilities_for("pi", "wezterm")["native_state"])
 
 
 if __name__ == "__main__":

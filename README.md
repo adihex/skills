@@ -7,22 +7,24 @@ A small set of Pi-compatible skills for visible workers, lifecycle evidence, and
 - Python 3.10+ (standard library only for bundled scripts).
 - Git 2.30+ for worktree and push evidence.
 - Pi and its team extension, installed from their official distributions.
-- Optional backends: Herdr, Fut, tmux, WezTerm, and Hax. Each skill checks its selected backend before side effects.
+- Optional runtimes/backends: Herdr, tmux, WezTerm, and Hax. Each skill checks its selected backend before side effects.
 - Hax subscription mode uses the official Codex CLI and `codex login`; no API key is required.
 - Cleanup process identity checks use `ps` and `lsof`.
 
-The repository does not bundle Herdr, Fut, Pi, GitHub CLI, or a network service. Install those from their official project instructions and verify with `<command> --version`. Use fake executables in `tests/fixtures/` for offline development.
+The repository does not bundle Herdr, Pi, GitHub CLI, or a network service. Install those from their official project instructions and verify with `<command> --version`. Use fake executables in `tests/fixtures/` for offline development.
 
 ## Install scripts
 
 Run from the repository root:
 
 ```bash
-export PATH="$PWD/skills/herdr-pi-team/scripts:$PWD/skills/fut-pi-team/scripts:$PWD/skills/tmux-pi-team/scripts:$PWD/skills/wezterm-pi-team/scripts:$PWD/skills/pi-dogfood-os/scripts:$PATH"
+export PATH="$PWD/skills/herdr-pi-team/scripts:$PWD/skills/tmux-pi-team/scripts:$PWD/skills/wezterm-pi-team/scripts:$PWD/skills/pi-dogfood-os/scripts:$PATH"
 python3 scripts/validate_skills.py
 ```
 
 Do not add generated status directories or manifests to the repository. Keep manifests under an operator-owned run directory. Set `DOGFOOD_STATUS_DIR` and `DOGFOOD_LOG` explicitly when their defaults are not appropriate.
+
+Launches share manifest-backed admission. Defaults are four total workers, four Pi workers, two Hax workers, two Codex subscription workers, and two concurrent setups. Configure them with `PI_TEAM_MAX_ACTIVE`, `PI_TEAM_MAX_ACTIVE_PI`, `PI_TEAM_MAX_ACTIVE_HAX`, `PI_TEAM_MAX_ACTIVE_CODEX`, and `PI_TEAM_SETUP_CONCURRENCY`. Memory pressure at 85% blocks new launches; `PI_TEAM_MEMORY_RATIO` exists only for deterministic testing.
 
 ## Offline validation
 
@@ -74,7 +76,6 @@ Run only when the relevant external service is intentionally available:
 
 ```bash
 herdr pane list
-fut list --json
 tmux list-panes -a
 wezterm cli list --format json
 gh auth status
@@ -104,7 +105,6 @@ Stop the watcher with Ctrl-C. It uses a per-manifest lock and never watches othe
 ## Skill map
 
 - `herdr-pi-team`: durable manifest, state machine, review/check gates, and safe worktree lifecycle.
-- `fut-pi-team`: visible Fut operations with honest terminal-input and native-state limitations.
 - `tmux-pi-team`: visible tmux operations with explicit pane identity and no native Pi state claim.
 - `wezterm-pi-team`: visible WezTerm operations with fenced submission and protected panes.
 - `pi-dogfood-os`: offline G1–G10 gate, F15–F24 taxonomy, and metrics.

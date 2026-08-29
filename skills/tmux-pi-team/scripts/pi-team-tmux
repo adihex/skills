@@ -22,6 +22,17 @@ if SPEC is None or SPEC.loader is None:
 hax_backend = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = hax_backend
 SPEC.loader.exec_module(hax_backend)
+DISPATCH_SPEC = importlib.util.spec_from_file_location("shared_dispatch_control_tmux", ROOT / "scripts" / "dispatch_control.py")
+if DISPATCH_SPEC is None or DISPATCH_SPEC.loader is None:
+    raise ImportError("shared dispatch control is unavailable")
+dispatch_control = importlib.util.module_from_spec(DISPATCH_SPEC)
+sys.modules[DISPATCH_SPEC.name] = dispatch_control
+DISPATCH_SPEC.loader.exec_module(dispatch_control)
+CLEANUP_SPEC = importlib.util.spec_from_file_location("shared_cleanup_tmux", ROOT / "skills" / "herdr-pi-team" / "scripts" / "cleanup.py")
+if CLEANUP_SPEC is None or CLEANUP_SPEC.loader is None:
+    raise ImportError("shared cleanup is unavailable")
+cleanup_module = importlib.util.module_from_spec(CLEANUP_SPEC)
+CLEANUP_SPEC.loader.exec_module(cleanup_module)
 
 NAME = "pi-team-tmux"
 VERSION = "0.2.0"
@@ -263,6 +274,9 @@ def main(argv=None):
     cleanup.add_argument("--dry-run", action="store_true")
     cleanup.add_argument("--confirm", action="store_true")
     cleanup.add_argument("--force", action="store_true")
+    cleanup.add_argument("--worktree-root", default=None)
+    cleanup.add_argument("--main-checkout", default=None)
+    cleanup.add_argument("--current-cwd", default=os.getcwd())
     add_backend_options(cleanup, suppress=True)
 
     args = parser.parse_args(argv)
@@ -296,17 +310,26 @@ def main(argv=None):
         brief = read_brief(args.brief_file)
         backend, config = backend_for(args)
         cwd = os.path.abspath(args.cwd)
+        path = safe_manifest_path(args, args.name)
+        reservation = dispatch_control.LaunchReservation(path.parent, config.backend)
+        try:
+            admission = reservation.acquire()
+        except dispatch_control.policy_module.DispatchRefused as exc:
+            fail(3, exc.code, str(exc), "wait for a tracked worker to finish or adjust the documented limits")
         readiness = None
         submission = None
         if config.backend == "hax":
             if config.mode == "oneshot":
                 result = backend.run_oneshot(config, prompt=brief, cwd=args.cwd)
-                manifest = {"run_id": f"tmux-{int(time.time())}", "label": args.name, "workspace_id": "direct-oneshot", "pane_id": "direct-oneshot",
-                            "cwd": cwd, "worktree": cwd, "branch": "unknown", "state": result["state"],
-                            "blocker": result.get("code") if result["state"] != "verifying" else None, "backend_exit_code": result.get("exit_code"),
-                            **config.manifest_fields(runtime="tmux")}
-                path = safe_manifest_path(args, args.name)
+                manifest = hax_backend.worker_manifest(
+                    config=config, runtime="tmux", run_id=f"tmux-{int(time.time())}", label=args.name,
+                    workspace_id="direct-oneshot", tab_id="direct-oneshot", pane_id="direct-oneshot", cwd=cwd,
+                    state=result["state"], blocker=result.get("code") if result["state"] != "verifying" else None,
+                    backend_exit_code=result.get("exit_code"), backend_error_code=result.get("code"),
+                )
                 save_manifest(path, manifest)
+                reservation.release()
+                manifest["dispatch_admission"] = admission
                 emit({**manifest, "manifest_path": str(path), "stdout": result["stdout"], "stderr": result["stderr"], "command": result["command"]})
                 return
             transport = TmuxHaxTransport()
@@ -329,14 +352,17 @@ def main(argv=None):
                 fail(2, "LAUNCH_FAILED", result.stderr.strip() or "tmux launch failed", "check tmux state")
             pane_id = result.stdout.strip()
             run(["select-pane", "-t", pane_id, "-T", PREFIX + args.name])
-        manifest = {"run_id": f"tmux-{int(time.time())}", "label": args.name, "workspace_id": "tmux", "tab_id": "tmux", "pane_id": pane_id,
-                    "cwd": cwd, "worktree": cwd, "branch": "unknown", "state": "working" if config.backend == "hax" else "ready",
-                    "blocker": None, **config.manifest_fields(runtime="tmux")}
+        manifest = hax_backend.worker_manifest(
+            config=config, runtime="tmux", run_id=f"tmux-{int(time.time())}", label=args.name,
+            workspace_id="tmux", tab_id="tmux", pane_id=pane_id, cwd=cwd,
+            state="working" if config.backend == "hax" else "ready",
+        )
         if readiness:
             manifest["hax_readiness"] = readiness
             manifest["hax_submission"] = submission
-        path = safe_manifest_path(args, args.name)
+        manifest["dispatch_admission"] = admission
         save_manifest(path, manifest)
+        reservation.release()
         emit({**manifest, "manifest_path": str(path), "launched": True, "split": args.split, "title": PREFIX + args.name, "briefChars": len(brief)})
         return
 
@@ -384,37 +410,52 @@ def main(argv=None):
             if row["isPi"]:
                 record = by_pane.get(row["paneId"], {})
                 backend_name = record.get("backend", "pi")
-                mode = (record.get("backend_config") or {}).get("mode", "interactive")
+                backend_config = record.get("backend_config") or {}
+                mode = backend_config.get("mode", "interactive")
                 capabilities = record.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "tmux")
                 limitations = record.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode)
                 workers.append({"paneId": row["paneId"], "label": row["label"], "backend": backend_name,
                                 "runtime": record.get("runtime", "tmux"), "state": record.get("state", "unknown"),
+                                "provider": backend_config.get("provider"), "model": backend_config.get("model"),
+                                "effort": backend_config.get("effort"), "mode": mode, "backend_config": backend_config,
                                 "backend_capabilities": capabilities, "backend_limitations": limitations})
         backend_name = saved.get("backend", "pi")
-        mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+        backend_config = saved.get("backend_config") or {}
+        mode = backend_config.get("mode", "interactive")
         emit({"runtime": "tmux", "backend": backend_name,
+              "provider": backend_config.get("provider"), "model": backend_config.get("model"),
+              "effort": backend_config.get("effort"), "mode": mode, "backend_config": backend_config,
               "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "tmux"),
               "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode), "workers": workers})
         return
 
     if args.cmd == "cleanup":
         if args.manifest:
+            if not args.worktree_root or not args.main_checkout:
+                fail(1, "CLEANUP_SCOPE_REQUIRED", "manifest cleanup requires --worktree-root and --main-checkout", "provide both paths; cleanup remains dry-run by default")
             saved = read_manifest(args.manifest)
             backend, config = backend_for(args, saved)
-            if config.backend == "hax":
-                pane_id = str(saved.get("pane_id") or saved.get("paneId") or "")
-                payload = {"runtime": "tmux", "backend": "hax", "dryRun": not args.confirm or args.dry_run, "pane_id": pane_id, "action": "plan"}
-                if payload["dryRun"]:
-                    emit(payload)
-                    return
-                try:
-                    shutdown = backend.stop({"pane_id": pane_id, "runtime": "tmux"}, TmuxHaxTransport())
-                except hax_backend.HaxLifecycleError as exc:
-                    fail(2, exc.code, str(exc), str(exc.details) if exc.details else None)
-                saved["backend_shutdown"] = shutdown
-                save_manifest(args.manifest, saved)
-                emit({**payload, "action": "stopped", "shutdown": shutdown})
-                return
+            def close_worker(value):
+                pane_id = str(value.get("pane_id") or value.get("paneId") or "")
+                if pane_id == "direct-oneshot":
+                    value["backend_shutdown"] = {"stopped": True, "reason": "process already exited"}
+                elif config.backend == "hax":
+                    value["backend_shutdown"] = backend.stop({"pane_id": pane_id, "runtime": "tmux"}, TmuxHaxTransport())
+                else:
+                    result = TmuxHaxTransport().stop({"pane_id": pane_id})
+                    if result["exit_code"]:
+                        raise cleanup_module.CleanupError("STOP_FAILED", "tmux pane stop failed", details=result)
+                    value["backend_shutdown"] = {"stopped": True, "shutdown_diagnostics": result}
+                save_manifest(args.manifest, value)
+            manager = cleanup_module.CleanupManager(
+                worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
+                workspace_closer=close_worker, manifest_writer=lambda value: save_manifest(args.manifest, value),
+            )
+            try:
+                emit(manager.cleanup(saved, confirm=args.confirm and not args.dry_run, require_pushed=True))
+            except cleanup_module.CleanupError as exc:
+                fail(3 if exc.code == "CLEANUP_REFUSED" else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
+            return
         if not args.pattern:
             fail(1, "USAGE", "cleanup needs --pattern or an Hax --manifest", "choose an explicit target")
         try:

@@ -76,8 +76,9 @@ class GitGateTests(unittest.TestCase):
         self.assertEqual(limited["review_status"], "blocked_external")
 
     def test_reply_requires_actual_evidence(self):
-        self.assertEqual(self.error_code(lambda: git_gate.GitGate.record_response(thread_id="t1", action="fixed", reply_id=None, commit_sha="abc")), "REPLY_EVIDENCE_REQUIRED")
-        result = git_gate.GitGate.record_response(thread_id="t1", action="fixed", reply_id="r1", commit_sha="abc")
+        self.assertEqual(self.error_code(lambda: git_gate.GitGate.record_response(thread_id="t1", comment_id="c1", action="fixed", reply_id=None, commit_sha="abc")), "REPLY_EVIDENCE_REQUIRED")
+        result = git_gate.GitGate.record_response(thread_id="t1", comment_id="c1", action="fixed", reply_id="r1", commit_sha="abc")
+        self.assertEqual(result["comment_id"], "c1")
         self.assertEqual(result["reply_id"], "r1")
 
     def test_checks_are_tied_to_commit_and_unrelated_failures_are_classified(self):

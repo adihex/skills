@@ -176,8 +176,18 @@ def scenario_h8():
                 os.environ.pop("FAKE_HAX_RESULT", None)
             else:
                 os.environ["FAKE_HAX_RESULT"] = previous
-        codes = [json_stdout(result).get("blocker") for result in results]
-        return all(result.returncode == 0 for result in results) and codes == ["HTTP_429"] * 3, {"blockers": codes, "retry_count": 0}
+        first = json_stdout(results[0]).get("blocker")
+        blocked_launches = []
+        for result in results[1:]:
+            try:
+                blocked_launches.append(json.loads(result.stderr).get("code"))
+            except ValueError:
+                blocked_launches.append(None)
+        ok = results[0].returncode == 0 and first == "HTTP_429" and all(
+            result.returncode == 3 and code == "HAX_QUOTA_BLOCKED"
+            for result, code in zip(results[1:], blocked_launches)
+        )
+        return ok, {"blockers": [first, *blocked_launches], "retry_count": 0, "new_launches_stopped": True}
 
 
 def scenario_h9():

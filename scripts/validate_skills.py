@@ -82,6 +82,15 @@ def iter_local_references(skill_dir: Path, text: str) -> Iterable[tuple[str, Pat
             yield candidate, skill_dir / candidate
 
 
+def iter_markdown_links(document: Path, text: str) -> Iterable[tuple[str, Path]]:
+    for match in LOCAL_LINK_RE.finditer(text):
+        raw = match.group(1).split("#", 1)[0].strip()
+        if not raw or raw.startswith(("http://", "https://", "mailto:", "#", "<", "/", "~", "$")):
+            continue
+        candidate = raw[2:] if raw.startswith("./") else raw
+        yield candidate, document.parent / candidate
+
+
 def find_bad_absolute_paths(text: str) -> list[str]:
     without_urls = re.sub(r"https?://[^\s)]+", "", text)
     paths: list[str] = []
@@ -159,6 +168,15 @@ def validate(root: Path) -> dict[str, object]:
                 errors.append(error(skill, "ABSOLUTE_LOCAL_PATH", f"invalid absolute local path: {absolute}"))
             if find_secrets(doc_text):
                 warnings.append({"skill": skill, "code": "SECRET_LOOKING_TEXT", "message": f"review {path.relative_to(skill_dir)}"})
+            for relative, target in iter_markdown_links(path, doc_text):
+                if not target.exists():
+                    errors.append(error(skill, "MISSING_REFERENCE", f"{path.relative_to(skill_dir)} links to missing resource: {relative}"))
+    readme = root / "README.md"
+    if readme.is_file():
+        text = readme.read_text(encoding="utf-8")
+        for relative, target in iter_markdown_links(readme, text):
+            if not target.exists():
+                errors.append(error("", "MISSING_REFERENCE", f"README.md links to missing resource: {relative}"))
     result["ok"] = not errors
     return result
 

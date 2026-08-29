@@ -8,13 +8,13 @@ The worktree was clean at baseline. The only pre-existing untracked path observe
 | Reference | Type | Existence at baseline | Notes |
 |---|---|---:|---|
 | `pi-team-herdr` | bundled script | yes | `skills/herdr-pi-team/scripts/pi-team-herdr`; executable |
-| `pi-team-fut` | bundled script | yes | `skills/fut-pi-team/scripts/pi-team-fut`; executable |
+| `pi-team-fut` | bundled script | no | No Fut package exists in this checkout; documentation must not advertise it. |
 | `pi-team-tmux` | bundled script | yes | `skills/tmux-pi-team/scripts/pi-team-tmux`; executable |
 | `pi-team-pane` | bundled script | yes | `skills/wezterm-pi-team/scripts/pi-team-pane`; executable |
 | `dogfood-score` | bundled script | yes | `skills/pi-dogfood-os/scripts/dogfood-score`; executable |
 | `run-golden` | bundled script | yes | `skills/pi-dogfood-os/scripts/run-golden`; executable |
 | `audit-dev-logs.sh` | bundled script | yes | `skills/yash-logger/scripts/audit-dev-logs.sh`; executable |
-| `references/*.md`, `templates/*.md` | bundled resources | yes | all paths referenced by the six skill packages exist |
+| `references/*.md`, `templates/*.md` | bundled resources | yes | all paths referenced by the five skill packages exist |
 | `herdr` | external command | yes on this host | `<host-bin>/herdr`; no live session used during reconnaissance |
 | `fut` | external command | no on this host | no binary in `PATH`; Fut fixtures are required for offline tests |
 | `tmux` | external command | yes on this host | `<host-bin>/tmux`; no server was started |

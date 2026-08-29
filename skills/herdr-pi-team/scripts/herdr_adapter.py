@@ -290,8 +290,13 @@ class HerdrAdapter:
             git["upstream_sha"] = upstream.stdout.strip() if upstream.returncode == 0 else None
             git["synchronized"] = bool(git["upstream_sha"] and git["head_sha"] == git["upstream_sha"])
         state = pane.get("agent_state") or pane.get("agent_status") or pane.get("state") if pane else "missing"
+        backend_config = manifest.get("backend_config", self.config.manifest_fields(runtime="herdr")["backend_config"])
         return {"backend": manifest.get("backend", self.config.backend), "runtime": manifest.get("runtime", "herdr"),
+                "provider": backend_config.get("provider"), "model": backend_config.get("model"),
+                "effort": backend_config.get("effort"), "mode": backend_config.get("mode"),
+                "backend_config": backend_config,
                 "backend_capabilities": manifest.get("backend_capabilities", self.hax.capabilities(self.config, runtime="herdr") if self.config.backend == "hax" else hax_backend.capabilities_for("pi", "herdr")),
+                "backend_limitations": manifest.get("backend_limitations", hax_backend.limitations_for(self.config.backend, self.config.mode)),
                 "native_state": state, "pane": pane, "manifest_state": manifest.get("state"),
                 "state_mismatch": pane is not None and state != manifest.get("state"),
                 "last_heartbeat": manifest.get("last_heartbeat"), "git": git,

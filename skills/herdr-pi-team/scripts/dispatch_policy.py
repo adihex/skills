@@ -42,7 +42,8 @@ class DispatchPolicy:
                 "wall_clock_seconds": self.wall_clock_seconds}
 
     def admit_backend(self, *, backend: str, active_workers: int, setup_workers: int, memory_ratio: float = 0.0,
-                      quota_blocked: bool = False) -> dict:
+                      quota_blocked: bool = False, total_active_workers: int | None = None,
+                      active_codex_workers: int | None = None) -> dict:
         if backend not in {"pi", "hax"}:
             raise DispatchRefused("BACKEND_UNSUPPORTED", f"unsupported backend: {backend}")
         if backend == "hax" and quota_blocked:
@@ -50,7 +51,10 @@ class DispatchPolicy:
         limit = self.max_active_hax_workers if backend == "hax" else self.max_active_pi_workers
         if active_workers >= limit:
             raise DispatchRefused("MAX_ACTIVE_HAX" if backend == "hax" else "MAX_ACTIVE_PI", f"{backend} worker limit reached")
-        result = self.admit(active_workers=active_workers, setup_workers=setup_workers, memory_ratio=memory_ratio)
+        if backend == "hax" and (active_codex_workers if active_codex_workers is not None else active_workers) >= self.max_active_codex_subscription_workers:
+            raise DispatchRefused("MAX_ACTIVE_CODEX", "Codex subscription worker limit reached")
+        result = self.admit(active_workers=total_active_workers if total_active_workers is not None else active_workers,
+                            setup_workers=setup_workers, memory_ratio=memory_ratio)
         result.update({"backend": backend, "backend_limit": limit, "max_active_codex_subscription_workers": self.max_active_codex_subscription_workers})
         return result
 

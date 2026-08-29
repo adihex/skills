@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
@@ -38,6 +39,7 @@ class CleanupManager:
     def __init__(self, *, worktree_root: str, main_checkout: str, current_cwd: str | None = None,
                  git_command: str = "git", process_inspector: Callable[[], list[dict] | None] | None = None,
                  process_stopper: Callable[[dict], None] | None = None,
+                 process_verifier: Callable[[dict], bool] | None = None,
                  workspace_closer: Callable[[dict], None] | None = None,
                  manifest_writer: Callable[[dict], None] | None = None):
         self.worktree_root = Path(worktree_root).resolve()
@@ -46,6 +48,7 @@ class CleanupManager:
         self.git_command = git_command
         self.process_inspector = process_inspector or self._inspect_processes
         self.process_stopper = process_stopper or self._stop_process
+        self.process_verifier = process_verifier or self._verify_process_stopped
         self.workspace_closer = workspace_closer or self._close_workspace
         self.manifest_writer = manifest_writer or (lambda _: None)
 
@@ -98,6 +101,20 @@ class CleanupManager:
     def _stop_process(process: dict) -> None:
         pid = int(process["pid"])
         os.kill(pid, signal.SIGTERM)
+
+    @staticmethod
+    def _verify_process_stopped(process: dict) -> bool:
+        pid = int(process["pid"])
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                return False
+            time.sleep(0.05)
+        return False
 
     @staticmethod
     def _close_workspace(manifest: dict) -> None:
@@ -183,6 +200,10 @@ class CleanupManager:
         try:
             for process in planned["processes"]:
                 self.process_stopper(process)
+            remaining = [process for process in planned["processes"] if not self.process_verifier(process)]
+            if remaining:
+                raise CleanupError("PROCESS_REMAINS", "owned process remains after scoped stop",
+                                   details={"pids": [process["pid"] for process in remaining]})
             self.workspace_closer(manifest)
             remover(manifest)
             pruner(manifest)

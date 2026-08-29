@@ -174,10 +174,10 @@ class GitGate:
                 "rate_limited": rate_limited, "comments": list(unique.values()), "review_threads": threads}
 
     @staticmethod
-    def record_response(*, thread_id: str, action: str, reply_id: str | None, commit_sha: str) -> dict:
-        if not thread_id or action not in {"fixed", "explained", "blocked"} or not reply_id or not commit_sha:
-            raise GateError("REPLY_EVIDENCE_REQUIRED", "actionable review response needs thread, action, reply ID, and commit SHA")
-        return {"thread_id": thread_id, "action": action, "reply_id": reply_id, "commit_sha": commit_sha}
+    def record_response(*, thread_id: str, comment_id: str, action: str, reply_id: str | None, commit_sha: str) -> dict:
+        if not thread_id or not comment_id or action not in {"fixed", "explained", "blocked"} or not reply_id or not commit_sha:
+            raise GateError("REPLY_EVIDENCE_REQUIRED", "actionable review response needs thread, comment, action, reply ID, and commit SHA")
+        return {"thread_id": thread_id, "comment_id": comment_id, "action": action, "reply_id": reply_id, "commit_sha": commit_sha}
 
     def poll_checks(self, *, repository: str, commit_sha: str, pr_number: int | None = None) -> dict:
         args = ["pr", "checks", "--commit", commit_sha, "--repo", repository, "--json", "name,state,bucket,headSha"]

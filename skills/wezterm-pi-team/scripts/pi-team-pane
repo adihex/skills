@@ -24,6 +24,17 @@ if SHARED_SPEC is None or SHARED_SPEC.loader is None:
 hax_backend = importlib.util.module_from_spec(SHARED_SPEC)
 sys.modules[SHARED_SPEC.name] = hax_backend
 SHARED_SPEC.loader.exec_module(hax_backend)
+DISPATCH_SPEC = importlib.util.spec_from_file_location("shared_dispatch_control_wezterm", ROOT / "scripts" / "dispatch_control.py")
+if DISPATCH_SPEC is None or DISPATCH_SPEC.loader is None:
+    raise ImportError("shared dispatch control is unavailable")
+dispatch_control = importlib.util.module_from_spec(DISPATCH_SPEC)
+sys.modules[DISPATCH_SPEC.name] = dispatch_control
+DISPATCH_SPEC.loader.exec_module(dispatch_control)
+CLEANUP_SPEC = importlib.util.spec_from_file_location("shared_cleanup_wezterm", ROOT / "skills" / "herdr-pi-team" / "scripts" / "cleanup.py")
+if CLEANUP_SPEC is None or CLEANUP_SPEC.loader is None:
+    raise ImportError("shared cleanup is unavailable")
+cleanup_module = importlib.util.module_from_spec(CLEANUP_SPEC)
+CLEANUP_SPEC.loader.exec_module(cleanup_module)
 VERSION = "0.2.0"
 MODEL_DEFAULT = "opencode/deepseek-v4-flash-free"
 EXTENSION_DEFAULT = "~/.pi/agent/extensions/team.ts"
@@ -93,7 +104,7 @@ def wz(argv, cwd=None):
     cmd += argv
     timeout_sec = wz_timeout_sec()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout_sec)
+        p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout_sec, shell=False)
     except FileNotFoundError:
         fail(2, "wezterm binary not found on PATH", "install wezterm or add its bin directory to PATH")
     except subprocess.TimeoutExpired:
@@ -331,6 +342,12 @@ def do_launch(args):
     if not os.path.isdir(cwd):
         fail(2, "cwd does not exist: %s" % cwd, "pass --cwd pointing at an existing directory")
     backend, config = backend_for_args(args)
+    manifest_path = Path(getattr(args, "manifest", None) or os.path.join("/tmp", "team-task", "manifests", args.name + ".json"))
+    reservation = dispatch_control.LaunchReservation(manifest_path.parent, config.backend)
+    try:
+        admission = reservation.acquire()
+    except dispatch_control.policy_module.DispatchRefused as exc:
+        fail_code(3, exc.code, str(exc), "wait for a tracked worker to finish or adjust the documented limits")
     if config.backend == "hax":
         try:
             backend.preflight(config)
@@ -350,7 +367,7 @@ def do_launch(args):
         except (hax_backend.HaxLifecycleError, hax_backend.HaxPreflightError) as exc:
             fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
         pane_id = int(started["pane_id"])
-        return pane_id, started["split"], started["title"], " ".join(home_display(str(value)) for value in backend.build_command(config)), config
+        return pane_id, started["split"], started["title"], " ".join(home_display(str(value)) for value in backend.build_command(config)), config, reservation, admission, manifest_path
 
 
     ext = os.path.expanduser(args.extension or EXTENSION_DEFAULT)
@@ -378,7 +395,7 @@ def do_launch(args):
         fail(2, "wezterm %s did not return a pane id (got %r)" % (split, out), "check wezterm version")
     title = "%s%s - %s" % (TITLE_PREFIX, args.name, os.path.basename(cwd))
     command_display = " ".join(home_display(str(value)) for value in worker_prog)
-    return new_pid, split, title, command_display, config
+    return new_pid, split, title, command_display, config, reservation, admission, manifest_path
 
 
 
@@ -389,20 +406,29 @@ def cmd_launch(args):
         brief_file = os.path.abspath(args.brief_file)
         if not os.path.isfile(brief_file) or not os.access(brief_file, os.R_OK):
             fail(2, "brief file not readable: %s" % brief_file, "create the brief file first, then retry")
+        path = args.manifest or os.path.join("/tmp", "team-task", "manifests", args.name + ".json")
+        reservation = dispatch_control.LaunchReservation(Path(path).parent, requested.backend)
+        try:
+            admission = reservation.acquire()
+        except dispatch_control.policy_module.DispatchRefused as exc:
+            fail_code(3, exc.code, str(exc), "wait for a tracked worker to finish or adjust the documented limits")
         try:
             result = backend.run_oneshot(requested, prompt=Path(brief_file).read_text(encoding="utf-8"), cwd=args.cwd)
         except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
             fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
-        manifest = {"run_id": "wezterm-direct-oneshot", "label": args.name, "workspace_id": "direct-oneshot", "tab_id": "direct-oneshot", "pane_id": "direct-oneshot",
-                    "cwd": os.path.abspath(args.cwd), "worktree": os.path.abspath(args.cwd), "branch": "unknown", "state": result["state"],
-                    "blocker": result.get("code") if result["state"] != "verifying" else None, "backend_exit_code": result.get("exit_code"),
-                    **requested.manifest_fields(runtime="wezterm")}
-        path = args.manifest or os.path.join("/tmp", "team-task", "manifests", args.name + ".json")
+        manifest = hax_backend.worker_manifest(
+            config=requested, runtime="wezterm", run_id="wezterm-direct-oneshot", label=args.name,
+            workspace_id="direct-oneshot", tab_id="direct-oneshot", pane_id="direct-oneshot", cwd=args.cwd,
+            state=result["state"], blocker=result.get("code") if result["state"] != "verifying" else None,
+            backend_exit_code=result.get("exit_code"), backend_error_code=result.get("code"),
+        )
+        manifest["dispatch_admission"] = admission
         save_manifest(path, manifest)
+        reservation.release()
         emit({**manifest, "manifest_path": path, "stdout": result["stdout"], "stderr": result["stderr"], "command": result["command"]})
         return
     try:
-        pid, split, title, command_display, config = do_launch(args)
+        pid, split, title, command_display, config, reservation, admission, manifest_path = do_launch(args)
     except (hax_backend.HaxConfigError, hax_backend.HaxPreflightError) as exc:
         fail_code(2, getattr(exc, "code", "HAX_PREFLIGHT_FAILED"), str(exc) + (" " + str(getattr(exc, "details", {})) if getattr(exc, "details", {}) else ""))
     readiness = {"ready": True, "code": "interactive_prompt"} if config.backend == "hax" else None
@@ -412,13 +438,17 @@ def cmd_launch(args):
             submission = backend.send({"pane_id": pid, "runtime": "wezterm"}, Path(args.brief_file).read_text(encoding="utf-8"), WeztermHaxTransport())
         except hax_backend.HaxLifecycleError as exc:
             fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
-    manifest = {"run_id": "wezterm-%s" % pid, "label": args.name, "workspace_id": "wezterm", "tab_id": "wezterm", "pane_id": pid,
-                "cwd": os.path.abspath(args.cwd or os.getcwd()), "worktree": os.path.abspath(args.cwd or os.getcwd()), "branch": "unknown",
-                "state": "working" if config.backend == "hax" else "ready", "blocker": None, **config.manifest_fields(runtime="wezterm")}
+    manifest = hax_backend.worker_manifest(
+        config=config, runtime="wezterm", run_id="wezterm-%s" % pid, label=args.name,
+        workspace_id="wezterm", tab_id="wezterm", pane_id=pid, cwd=args.cwd or os.getcwd(),
+        state="working" if config.backend == "hax" else "ready",
+    )
     if readiness:
         manifest.update({"hax_readiness": readiness, "hax_submission": submission})
-    path = args.manifest or os.path.join("/tmp", "team-task", "manifests", args.name + ".json")
+    manifest["dispatch_admission"] = admission
+    path = str(manifest_path)
     save_manifest(path, manifest)
+    reservation.release()
     emit({**manifest, "manifest_path": path, "title": title, "command": command_display, "split": split})
 
 def cmd_send(args):
@@ -527,8 +557,11 @@ def cmd_status(args):
                             key=lambda d: os.path.getmtime(d), reverse=True)
         if not candidates:
             backend_name = saved.get("backend", "pi")
-            mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+            backend_config = saved.get("backend_config") or {}
+            mode = backend_config.get("mode", "interactive")
             emit({"root": root, "dir": None, "dispatch": None, "runtime": "wezterm", "backend": backend_name,
+                  "provider": backend_config.get("provider"), "model": backend_config.get("model"),
+                  "effort": backend_config.get("effort"), "mode": mode, "backend_config": backend_config,
                   "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm"),
                   "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode), "workers": []})
             return
@@ -560,12 +593,15 @@ def cmd_status(args):
     for label in sorted(by_label):
         rec = by_label[label]
         backend_name = rec.get("backend", "pi")
-        mode = (rec.get("backend_config") or {}).get("mode", "interactive")
+        backend_config = rec.get("backend_config") or {}
+        mode = backend_config.get("mode", "interactive")
         capabilities = rec.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm")
         limitations = rec.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode)
         w = {"label": label, "status": rec.get("status"), "activity": rec.get("activity"),
              "turn": rec.get("turn"), "updatedAt": rec.get("updatedAt"), "source": rec.get("source"), "paneId": None,
-             "backend": backend_name, "runtime": rec.get("runtime", "wezterm"), "backend_capabilities": capabilities,
+             "backend": backend_name, "runtime": rec.get("runtime", "wezterm"),
+             "provider": backend_config.get("provider"), "model": backend_config.get("model"),
+             "effort": backend_config.get("effort"), "mode": mode, "backend_config": backend_config, "backend_capabilities": capabilities,
              "backend_limitations": limitations}
         p = pane_by_label.get(label)
         if p is not None:
@@ -573,8 +609,11 @@ def cmd_status(args):
             matched.append({"paneId": p["paneId"], "title": p["title"], "label": label})
         workers.append(w)
     backend_name = saved.get("backend", "pi")
-    mode = (saved.get("backend_config") or {}).get("mode", "interactive")
+    backend_config = saved.get("backend_config") or {}
+    mode = backend_config.get("mode", "interactive")
     payload = {"root": root, "dir": dispatch_dir, "dispatch": dispatch, "backend": backend_name, "runtime": "wezterm",
+               "provider": backend_config.get("provider"), "model": backend_config.get("model"),
+               "effort": backend_config.get("effort"), "mode": mode, "backend_config": backend_config,
                "backend_capabilities": saved.get("backend_capabilities") or hax_backend.capabilities_for(backend_name, "wezterm"),
                "backend_limitations": saved.get("backend_limitations") or hax_backend.limitations_for(backend_name, mode),
                "workers": workers, "panes": matched}
@@ -603,22 +642,37 @@ def cmd_status(args):
 
 def cmd_cleanup(args):
     if args.manifest:
+        if not args.worktree_root or not args.main_checkout:
+            fail_code(1, "CLEANUP_SCOPE_REQUIRED", "manifest cleanup requires --worktree-root and --main-checkout", "provide both paths; cleanup remains dry-run by default")
         saved = read_manifest(args.manifest)
         backend, config = backend_for_args(args, saved)
-        if config.backend == "hax":
-            pane_id = int(saved.get("pane_id") or saved.get("paneId") or 0)
-            payload = {"runtime": "wezterm", "backend": "hax", "dryRun": not args.confirm or args.dry_run, "pane_id": pane_id, "action": "plan"}
-            if payload["dryRun"]:
-                emit(payload)
-                return
-            try:
-                shutdown = backend.stop({"pane_id": pane_id, "runtime": "wezterm"}, WeztermHaxTransport())
-            except hax_backend.HaxLifecycleError as exc:
-                fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
-            saved["backend_shutdown"] = shutdown
-            save_manifest(args.manifest, saved)
-            emit({**payload, "action": "stopped", "shutdown": shutdown})
-            return
+        def close_worker(value):
+            raw_pane_id = value.get("pane_id") or value.get("paneId")
+            if raw_pane_id == "direct-oneshot":
+                value["backend_shutdown"] = {"stopped": True, "reason": "process already exited"}
+            else:
+                pane_id = int(raw_pane_id or 0)
+                panes, current = list_panes()
+                pane = find_pane(panes, pane_id)
+                if pane_id == 0 or pane_id == current or pane is None or sum(row["winId"] == pane["winId"] for row in panes) <= 1:
+                    raise cleanup_module.CleanupError("PANE_PROTECTED", "WezTerm pane cleanup safety gate refused stop")
+                if config.backend == "hax":
+                    value["backend_shutdown"] = backend.stop({"pane_id": pane_id, "runtime": "wezterm"}, WeztermHaxTransport())
+                else:
+                    result = WeztermHaxTransport().stop({"pane_id": pane_id})
+                    if result["exit_code"]:
+                        raise cleanup_module.CleanupError("STOP_FAILED", "WezTerm pane stop failed", details=result)
+                    value["backend_shutdown"] = {"stopped": True, "shutdown_diagnostics": result}
+            save_manifest(args.manifest, value)
+        manager = cleanup_module.CleanupManager(
+            worktree_root=args.worktree_root, main_checkout=args.main_checkout, current_cwd=args.current_cwd,
+            workspace_closer=close_worker, manifest_writer=lambda value: save_manifest(args.manifest, value),
+        )
+        try:
+            emit(manager.cleanup(saved, confirm=args.confirm and not args.dry_run, require_pushed=True))
+        except cleanup_module.CleanupError as exc:
+            fail_code(3 if exc.code == "CLEANUP_REFUSED" else 2, exc.code, str(exc), json.dumps(exc.details, sort_keys=True) if exc.details else None)
+        return
     pattern = args.pattern
     if not pattern:
         fail(1, "cleanup requires --pattern or an Hax --manifest", "choose an explicit target")
@@ -732,18 +786,28 @@ def delegate_lifecycle(args):
 
 def cmd_launch_dispatch(args):
     backend, _ = backend_for_args(args)
-    pid, split, title, pi_cmd, config = do_launch(args)
+    pid, split, title, pi_cmd, config, reservation, admission, manifest_path = do_launch(args)
     text = args.dispatch_instruction
     if config.backend == "hax":
         try:
             backend.send({"pane_id": pid, "runtime": "wezterm"}, text, WeztermHaxTransport())
         except hax_backend.HaxLifecycleError as exc:
             fail_code(2, exc.code, str(exc), str(exc.details) if exc.details else None)
+        manifest = hax_backend.worker_manifest(config=config, runtime="wezterm", run_id="wezterm-%s" % pid,
+                                               label=args.name, workspace_id="wezterm", tab_id="wezterm", pane_id=pid,
+                                               cwd=args.cwd, state="working", dispatch_admission=admission)
+        save_manifest(manifest_path, manifest)
+        reservation.release()
         emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True, "backend": "hax"})
         return
     rc, phase, err = fenced_send_submit(pid, text)
     if rc != 0:
         fail(2, "launch succeeded but dispatch send failed during %s: %s" % (phase, err), "worker pane is live; resend with pi-team-pane send")
+    manifest = hax_backend.worker_manifest(config=config, runtime="wezterm", run_id="wezterm-%s" % pid,
+                                           label=args.name, workspace_id="wezterm", tab_id="wezterm", pane_id=pid,
+                                           cwd=args.cwd, state="ready", dispatch_admission=admission)
+    save_manifest(manifest_path, manifest)
+    reservation.release()
     emit({"paneId": pid, "split": split, "title": title, "dispatched": True, "chars": len(text), "fenced": True, "backend": "pi"})
 
 
@@ -847,6 +911,9 @@ def build_parser():
     p_cleanup.add_argument("--manifest", default=None, help="exact backend-owned worker manifest")
     p_cleanup.add_argument("--dry-run", action="store_true", help="explicit dry run (default mode)")
     p_cleanup.add_argument("--confirm", action="store_true", help="actually kill matched panes")
+    p_cleanup.add_argument("--worktree-root", default=None)
+    p_cleanup.add_argument("--main-checkout", default=None)
+    p_cleanup.add_argument("--current-cwd", default=os.getcwd())
     p_cleanup.add_argument("--force", action="store_true",
                            help="allow matching non-pi panes; pane 0/current/last-pane protection remains absolute")
     p_cleanup.add_argument("--human", action="store_true", help="human-readable listing")
@@ -860,6 +927,7 @@ def build_parser():
     p_lad.add_argument("--percent", type=percent_int, default=None,
                        help="split size as a percentage of available space (10..90; split panes only)")
     p_lad.add_argument("--cwd", default=os.getcwd())
+    p_lad.add_argument("--manifest", default=None)
     add_backend_args(p_lad)
     p_lad.add_argument("--extension", default=EXTENSION_DEFAULT)
 

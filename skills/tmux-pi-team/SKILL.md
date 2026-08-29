@@ -40,6 +40,7 @@ pi-team-tmux status [--manifest FILE]
 pi-team-tmux doctor --backend hax --provider codex --model MODEL
 pi-team-tmux complete --manifest FILE --report FILE --repository OWNER/REPO
 pi-team-tmux cleanup --pattern REGEX [--confirm]
+pi-team-tmux cleanup --manifest FILE --worktree-root ROOT --main-checkout CHECKOUT [--confirm]
 ```
 
 JSON is the default. Exit `0` is success, `1` usage, `2` tmux/runtime failure, and `3` safety refusal. Cleanup is dry-run unless `--confirm` is supplied. Non-Pi panes are rejected unless `--force`.
@@ -50,5 +51,6 @@ JSON is the default. Exit `0` is success, `1` usage, `2` tmux/runtime failure, a
 - Never execute worker output or log prompts, tokens, cookies, or secrets.
 - Never treat pane presence or apparent idle text as completion.
 - Preview cleanup and confirm only an explicit regex. Do not remove a dirty or unsynchronized worktree through automation.
+- Pattern cleanup is manual pane cleanup only and never marks a worker complete. Manifest cleanup uses the common complete/clean/pushed/ownership/process gates and removes an owned disposable worktree transactionally.
 
 Use [herdr-pi-team](../herdr-pi-team/SKILL.md) for the durable manifest, state machine, review, and worktree cleanup contracts.
